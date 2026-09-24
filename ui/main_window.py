@@ -3,10 +3,11 @@
 import random, subprocess, sys, threading
 from datetime import datetime
 from pathlib import Path
+
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QLabel, QPushButton,
     QVBoxLayout, QHBoxLayout, QTextEdit, QFrame,
-    QStackedWidget, QListWidget, QListWidgetItem,
+    QStackedWidget, QListWidget, QListWidgetItem, QScrollArea, QSplitter,
 )
 from PyQt6.QtCore import Qt, QTimer, QSize
 from PyQt6.QtGui import QFont
@@ -15,8 +16,12 @@ from core.config import (
     APP, VER, AUTHOR, CREDIT, OUT_DIR, THEMES, WIN,
 )
 from core.signals import Sig
-from core.widgets import Card
-from core.utils import adb_dev, fb_dev, read_device_info, read_device_stats
+from core.widgets import Card, AnimatedProgressBar, set_state
+from ui.theme import build_qss, SIDEBAR_W, MENU_ITEM_H, H_BTN
+from core.utils import (
+    adb_dev, fb_dev, read_device_info, read_device_stats,
+    detect_device_mode, MODE_LABELS, MODE_TIPS,
+)
 
 from pages.page_info import InfoPageMixin
 from pages.page_flash import FlashPageMixin
@@ -25,24 +30,50 @@ from pages.page_files import FilesPageMixin
 from pages.page_mirror import MirrorPageMixin
 from pages.page_payload import PayloadPageMixin
 from pages.page_root import RootPageMixin
+from pages.page_recovery import RecoveryPageMixin
+
+# 页面索引（删掉脱机修补后重排）
+PAGE_INFO = 0
+PAGE_FLASH = 1
+PAGE_PATCH = 2
+PAGE_PAYLOAD = 3
+PAGE_FILES = 4
+PAGE_MIRROR = 5
+PAGE_ROOT = 6
+PAGE_RECOVERY = 7
+
+# 这些页面各自有内部输出面板 → 隐藏底部公共运行日志（把空间让给页面）
+NO_LOG_PAGES = {PAGE_PATCH, PAGE_PAYLOAD, PAGE_MIRROR, PAGE_ROOT, PAGE_RECOVERY}
+
+# 设备模式 → 右上角胶囊的（文字, 状态标记）
+REC_MODE_UI = {
+    "none":         ("未连接",        "err"),
+    "system":       ("系统模式",      "ok"),
+    "recovery":     ("Recovery 模式", "warn"),
+    "sideload":     ("Sideload 模式", "acc"),
+    "fastboot":     ("Fastboot 模式", "warn"),
+    "unauthorized": ("未授权",        "warn"),
+    "offline":      ("离线",          "err"),
+}
 
 
 class MainWin(InfoPageMixin, FlashPageMixin, PatchPageMixin,
-              FilesPageMixin, MirrorPageMixin, PayloadPageMixin,
-              RootPageMixin, QMainWindow):
+              PayloadPageMixin,
+              FilesPageMixin, MirrorPageMixin,
+              RootPageMixin, RecoveryPageMixin, QMainWindow):
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP}  ·  {VER}")
-        self.resize(1200, 920)
-        self.setMinimumSize(1080, 820)
+        self.resize(1260, 940)
+        self.setMinimumSize(1040, 720)
 
         self.src = None
         self.outdir = Path(OUT_DIR)
         self.outpath = None
         self.working = False
         self.img = None
-        self.theme = random.choice(THEMES)
+        self.theme = THEMES[0]          # 默认固定主题（🎲 可随机换）
         self.scrcpy_proc = None
         self._last_dev = "__init__"
         self._sel_name = None
@@ -64,21 +95,19 @@ class MainWin(InfoPageMixin, FlashPageMixin, PatchPageMixin,
         self.sig.patch_fail.connect(self._fail)
         self.sig.prog2.connect(self._set_prog2)
         self.sig.flashprog.connect(self._set_flash_prog)
-        self.sig.payloadprog.connect(self._payload_set_prog)
         self.sig.ui.connect(self._run_ui_callback)
         self.sig.miflash_done.connect(self._miflash_finalize)
         self.sig.stats.connect(self._apply_stats)
+        self.sig.recmode.connect(self._apply_rec_mode)
         self._resize_timer = QTimer()
         self._resize_timer.setSingleShot(True)
         self._resize_timer.timeout.connect(self._relayout_files_grid)
 
+        self._theme_hooks = []      # 页面注册的"主题变化"回调（自绘控件用）
         self._build()
         self._apply_theme()
         self._switch_page(0)
         self.lg(f"{APP} {VER}  ·  作者：{AUTHOR}", "info")
-
-    def _run_ui_callback(self, callback):
-        callback()
         self.lg(CREDIT)
         self.lg("提示：点 🎲 可以随机换主题", "info")
         self.lg("提示：连接设备后会自动读取信息和文件", "info")
@@ -87,6 +116,12 @@ class MainWin(InfoPageMixin, FlashPageMixin, PatchPageMixin,
         self._auto_timer.timeout.connect(self._auto_check)
         self._auto_timer.start(3000)
         QTimer.singleShot(800, self._auto_check)
+
+    def _run_ui_callback(self, callback):
+        try:
+            callback()
+        except Exception as e:
+            self.lg(f"UI 回调异常：{e}", "error")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -105,33 +140,43 @@ class MainWin(InfoPageMixin, FlashPageMixin, PatchPageMixin,
 
         self.sidebar = QFrame()
         self.sidebar.setObjectName("sidebar")
-        self.sidebar.setFixedWidth(200)
+        self.sidebar.setFixedWidth(SIDEBAR_W)
         sv = QVBoxLayout(self.sidebar)
         sv.setContentsMargins(0, 0, 0, 0)
         sv.setSpacing(0)
 
-        title = QLabel("⚡ 工具")
+        top = QFrame()
+        top.setObjectName("sideTop")
+        tv = QVBoxLayout(top)
+        tv.setContentsMargins(16, 16, 16, 14)
+        tv.setSpacing(3)
+        title = QLabel("⚡  一键工具箱")
         title.setObjectName("sideTitle")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setFixedHeight(80)
-        sv.addWidget(title)
+        sub = QLabel(f"{VER}   ·   {AUTHOR}")
+        sub.setObjectName("sideSub")
+        tv.addWidget(title)
+        tv.addWidget(sub)
+        sv.addWidget(top)
 
         self.menu = QListWidget()
         self.menu.setObjectName("sideMenu")
         self.menu.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.menu.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         items = [
-            ("📱   手机信息 & 重启", "info"),
-            ("📦   常规镜像刷入", "flash"),
-            ("🔧   Preloader 修补", "patch"),
-            ("📂   文件传输 & 预览", "files"),
-            ("🖥   投屏（scrcpy）", "mirror"),
-            ("🧩   Payload / 链接提取", "payload"),  
-            ("🛡   临时提权", "root"),
+            ("📱  主页", "info"),
+            ("📦  常规镜像刷入", "flash"),
+            ("🔧  文件修补", "patch"),
+            ("🧩  Payload 可视化", "payload"),
+            ("📂  文件传输", "files"),
+            ("🖥  投屏", "mirror"),
+            ("🛡  临时提权", "root"),
+            ("🛠  Recovery 工具", "recovery"),
         ]
         for text, key in items:
             it = QListWidgetItem(text)
             it.setData(Qt.ItemDataRole.UserRole, key)
-            it.setSizeHint(QSize(0, 52))
+            it.setSizeHint(QSize(0, MENU_ITEM_H))
             self.menu.addItem(it)
         self.menu.currentRowChanged.connect(self._switch_page)
         sv.addWidget(self.menu, 1)
@@ -156,10 +201,11 @@ class MainWin(InfoPageMixin, FlashPageMixin, PatchPageMixin,
         self.cmdBtn.clicked.connect(self.open_cmd)
         bv.addWidget(self.cmdBtn)
 
-        ver = QLabel(f"{VER}   ·   {AUTHOR}")
+        ver = QLabel(f"作者：{AUTHOR}")
         ver.setObjectName("sideVer")
         ver.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ver.setFixedHeight(24)
+        ver.setWordWrap(True)
+        ver.setFixedHeight(28)
         bv.addWidget(ver)
 
         sv.addWidget(bottom)
@@ -167,11 +213,15 @@ class MainWin(InfoPageMixin, FlashPageMixin, PatchPageMixin,
 
         right = QWidget()
         rv = QVBoxLayout(right)
-        rv.setContentsMargins(24, 20, 24, 20)
-        rv.setSpacing(14)
+        rv.setContentsMargins(20, 16, 20, 14)
+        rv.setSpacing(12)
         outer.addWidget(right, 1)
 
-        hd = QHBoxLayout()
+        topBar = QFrame()
+        topBar.setObjectName("topBar")
+        hd = QHBoxLayout(topBar)
+        hd.setContentsMargins(18, 11, 14, 11)
+        hd.setSpacing(12)
         self.pageTitle = QLabel("手机信息 & 重启")
         self.pageTitle.setObjectName("pageTitle")
         hd.addWidget(self.pageTitle)
@@ -179,23 +229,28 @@ class MainWin(InfoPageMixin, FlashPageMixin, PatchPageMixin,
         self.devLabel = QLabel("● 未检测")
         self.devLabel.setObjectName("devStatus")
         hd.addWidget(self.devLabel)
+        # 设备模式胶囊（系统 / Recovery / Sideload / Fastboot），由 3 秒一次的自动检测刷新
+        self.modeLabel = QLabel("")
+        self.modeLabel.setObjectName("modeChip")
+        self.modeLabel.setToolTip(
+            "设备当前模式（系统 / Recovery / Sideload / Fastboot）\n"
+            "每 3 秒自动检测一次；Sideload、导出、推送是否可用看这里")
+        self.modeLabel.setVisible(False)
+        hd.addWidget(self.modeLabel)
         self.chkTopBtn = QPushButton("🔄  检测设备")
         self.chkTopBtn.setObjectName("ghost")
         self.chkTopBtn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.chkTopBtn.setFixedHeight(36)
+        self.chkTopBtn.setFixedHeight(H_BTN)
         self.chkTopBtn.clicked.connect(self.do_check)
         hd.addWidget(self.chkTopBtn)
-        rv.addLayout(hd)
+        rv.addWidget(topBar)
 
         self.stack = QStackedWidget()
-        self.stack.addWidget(self._page_info())
-        self.stack.addWidget(self._page_flash())
-        self.stack.addWidget(self._page_patch())
-        self.stack.addWidget(self._page_files())
-        self.stack.addWidget(self._page_mirror())
-        self.stack.addWidget(self._page_payload()) 
-        self.stack.addWidget(self._page_root())
-        rv.addWidget(self.stack, 1)
+        for builder in (self._page_info, self._page_flash, self._page_patch,
+                        self._page_payload,
+                        self._page_files, self._page_mirror, self._page_root,
+                        self._page_recovery):
+            self.stack.addWidget(self._wrap_page(builder()))
 
         self.logCard = Card()
         ll = QVBoxLayout(self.logCard)
@@ -207,7 +262,7 @@ class MainWin(InfoPageMixin, FlashPageMixin, PatchPageMixin,
         lh.addWidget(t)
         lh.addStretch()
         self.clrBtn = QPushButton("清空")
-        self.clrBtn.setObjectName("ghost")
+        self.clrBtn.setObjectName("smallGhost")
         self.clrBtn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.clrBtn.setFixedHeight(30)
         self.clrBtn.clicked.connect(lambda: self.logbox.clear())
@@ -217,31 +272,80 @@ class MainWin(InfoPageMixin, FlashPageMixin, PatchPageMixin,
         self.logbox.setReadOnly(True)
         self.logbox.setObjectName("log")
         self.logbox.setFont(QFont("Consolas", 9))
-        self.logbox.setFixedHeight(140)
+        self.logbox.setMinimumHeight(84)
         ll.addWidget(self.logbox)
-        rv.addWidget(self.logCard)
+
+        # 页面区 / 日志区 可拖拽分配高度
+        self.vsplit = QSplitter(Qt.Orientation.Vertical)
+        self.vsplit.setObjectName("mainSplit")
+        self.vsplit.setChildrenCollapsible(False)
+        self.vsplit.setHandleWidth(8)
+        self.vsplit.addWidget(self.stack)
+        self.vsplit.addWidget(self.logCard)
+        self.vsplit.setStretchFactor(0, 4)
+        self.vsplit.setStretchFactor(1, 1)
+        self.vsplit.setSizes([560, 190])
+        rv.addWidget(self.vsplit, 1)
 
         ft = QLabel(f"⚠  刷机有风险 · 本工具由 {AUTHOR} 制作，仅供学习研究")
         ft.setObjectName("footer")
         ft.setAlignment(Qt.AlignmentFlag.AlignCenter)
         rv.addWidget(ft)
 
+    def _wrap_page(self, widget):
+        """内容比可视区域高时自动出现滚动条（本来就有滚动区的页面不重复包）"""
+        try:
+            if isinstance(widget, QScrollArea) or widget.findChild(QScrollArea):
+                return widget
+        except Exception:
+            return widget
+        sa = QScrollArea()
+        sa.setObjectName("pageScroll")
+        sa.setWidgetResizable(True)
+        sa.setFrameShape(QFrame.Shape.NoFrame)
+        sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        sa.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        sa.setWidget(widget)
+        return sa
+
     def _switch_page(self, idx):
         if idx < 0:
             return
         self.stack.setCurrentIndex(idx)
+        # 让侧边栏同步高亮（启动时 currentRow 为 -1，否则没有任何激活项）
+        try:
+            if 0 <= idx < self.menu.count() and self.menu.currentRow() != idx:
+                self.menu.setCurrentRow(idx)
+        except Exception:
+            pass
         titles = [
             "手机信息 & 重启",
             "常规镜像刷入",
             "Preloader 修补",
+            "Payload 可视化",
             "文件传输 & 预览",
             "投屏（scrcpy）",
-            "Payload / 链接提取",           # ← 新增
             "临时提权",
+            "Recovery 工具 & Sideload",
         ]
         self.pageTitle.setText(titles[idx] if 0 <= idx < len(titles) else "")
-        if idx == 3:
+
+        # 这些页面自带输出面板 → 隐藏底部公共日志，空间给页面
+        try:
+            want_log = idx not in NO_LOG_PAGES
+            if self.logCard.isVisible() != want_log:
+                self.logCard.setVisible(want_log)
+        except Exception:
+            pass
+
+        if idx == PAGE_FILES:
             QTimer.singleShot(0, self._relayout_files_grid)
+        elif idx == PAGE_FLASH:
+            # 进常规刷入页时自动看一眼 root 状态（有 ADB 设备才真正去探测）
+            QTimer.singleShot(0, self._maint_auto_probe)
+        elif idx == PAGE_RECOVERY:
+            # 进 Recovery 页时立刻刷新一次设备模式（之后由 3 秒轮询维护）
+            QTimer.singleShot(0, self._auto_check)
 
     def _label(self, text):
         lb = QLabel(text)
@@ -256,289 +360,25 @@ class MainWin(InfoPageMixin, FlashPageMixin, PatchPageMixin,
 
     def _apply_theme(self):
         c = self.theme
-        qss = f"""
-        QMainWindow, QWidget {{
-            background: {c['bg']};
-            color: {c['text']};
-            font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
-            font-size: 10pt;
-        }}
-        QLabel {{ background: transparent; }}
-        QFrame#sidebar {{ background: {c['menu']}; border: none; }}
-        QLabel#sideTitle {{
-            font-size: 16pt; font-weight: bold; color: {c['text']};
-            background: {c['menu']}; border: none;
-        }}
-        QFrame#sideBottom {{
-            background: {c['menu']};
-            border-top: 1px solid {c['line']};
-        }}
-        QLabel#sideVer {{ color: {c['dim']}; font-size: 8pt; background: {c['menu']}; }}
-        QListWidget#sideMenu {{
-            background: {c['menu']}; border: none; outline: 0;
-                QTextEdit#rootOutput QScrollBar:vertical,
-                QTextEdit#rootOutput QScrollBar::handle:vertical,
-            color: {c['menuTxt']}; font-size: 11pt; padding: 8px 0;
-        }}
-        QListWidget#sideMenu::item {{
-            padding: 12px 16px; margin: 2px 8px; border-radius: 8px;
-            color: {c['menuTxt']};
-        }}
-        QListWidget#sideMenu::item:hover {{
-            background: {c['panel']}; color: {c['text']};
-        }}
-        QListWidget#sideMenu::item:selected {{
-            background: {c['menuSel']}; color: white; font-weight: bold;
-        }}
-        QPushButton#sideBtn {{
-            background: {c['panel2']}; color: {c['text']};
-            border: 1px solid {c['line']}; border-radius: 8px;
-            font-weight: bold;
-        }}
-        QPushButton#sideBtn:hover {{
-            background: {c['acc']}; color: white; border: 1px solid {c['acc']};
-                QTextEdit#rootOutput QScrollBar:horizontal,
-        }}
-        QPushButton#sideBtn2 {{
-            background: {c['panel']}; color: {c['text']};
-            border: 1px solid {c['line']}; border-radius: 8px;
-            font-weight: bold;
-        }}
-        QPushButton#sideBtn2:hover {{
-            background: {c['acc2']}; color: white; border: 1px solid {c['acc2']};
-        }}
-        QLabel#pageTitle {{ font-size: 18pt; font-weight: bold; color: {c['text']}; }}
-        QLabel#devStatus {{ color: {c['dim']}; font-weight: bold; }}
-        QLabel#cardTitle {{ font-size: 12pt; font-weight: bold; color: {c['text']}; }}
-        QLabel#desc {{ color: {c['dim']}; }}
-        QLabel#label {{ color: {c['text']}; font-weight: bold; }}
-        QLabel#info {{ color: {c['dim']}; }}
-        QLabel#infoKey {{ color: {c['dim']}; font-weight: normal; }}
-        QLabel#infoVal {{ color: {c['text']}; font-weight: bold; }}
-        QLabel#status {{ color: {c['text']}; font-weight: bold; }}
-        QLabel#footer {{ color: {c['err']}; padding: 4px; }}
-        QFrame#card {{
-            background: {c['panel']};
-            border: 1px solid {c['line']};
-            border-radius: 12px;
-        }}
-        QLineEdit {{
-            background: {c['log']}; border: 1px solid {c['line']};
-            border-radius: 8px; padding: 8px 12px;
-            color: {c['text']}; selection-background-color: {c['acc']};
-        }}
-        QLineEdit:focus {{ border: 1px solid {c['acc']}; }}
-        QComboBox {{
-            background: {c['log']};
-            border: 1px solid {c['line']};
-            border-radius: 8px;
-            padding: 6px 30px 6px 12px;
-            color: {c['text']};
-            min-height: 22px;
-            selection-background-color: {c['acc']};
-        }}
-        QComboBox:hover, QComboBox:focus, QComboBox:on {{
-            border: 1px solid {c['acc']};
-            background: {c['panel2']};
-        }}
-        QComboBox::drop-down {{
-            subcontrol-origin: padding;
-            subcontrol-position: center right;
-            width: 26px;
-            border-left: 1px solid {c['line']};
-            border-top-right-radius: 8px;
-            border-bottom-right-radius: 8px;
-            background: {c['panel2']};
-        }}
-        QComboBox::drop-down:hover {{ background: {c['acc']}; }}
-        QComboBox::down-arrow {{
-            image: none;
-            width: 0px; height: 0px;
-            border-left: 4px solid transparent;
-            border-right: 4px solid transparent;
-            border-top: 6px solid {c['acc2']};
-            margin-right: 8px;
-        }}
-        QComboBox::down-arrow:on {{
-            border-top: none;
-            border-bottom: 6px solid white;
-        }}
-        QComboBox QAbstractItemView {{
-            background: {c['panel2']}; color: {c['text']};
-            border: 1px solid {c['acc']}; border-radius: 8px;
-            padding: 6px; outline: 0;
-            selection-background-color: {c['acc']};
-            selection-color: white;
-        }}
-        QComboBox QAbstractItemView::item {{
-            min-height: 32px; padding: 4px 12px;
-            border-radius: 6px; color: {c['text']};
-        }}
-        QComboBox QAbstractItemView::item:hover {{
-            background: {c['line']}; color: {c['text']};
-        }}
-        QComboBox QAbstractItemView::item:selected {{
-            background: {c['acc']}; color: white;
-        }}
-        QSpinBox {{
-            background: {c['log']}; border: 1px solid {c['line']};
-            border-radius: 8px; padding: 6px 10px;
-            color: {c['text']}; min-height: 22px;
-        }}
-        QSpinBox:hover, QSpinBox:focus {{ border: 1px solid {c['acc']}; }}
-        QTextEdit#log {{
-            background: {c['log']}; border: 1px solid {c['line']};
-            border-radius: 8px; padding: 8px; color: {c['text']};
-        }}
-        QTextEdit#rootOutput {{
-            background: {c['log']}; border: 1px solid {c['line']};
-            border-radius: 8px; padding: 10px; color: {c['err']};
-        }}
-        QListWidget#payloadList {{
-            background: {c['log']};
-            border: 1px solid {c['line']};
-            border-radius: 8px;
-            padding: 6px;
-            color: {c['text']};
-            outline: 0;
-        }}
-        QListWidget#payloadList::item {{
-            padding: 10px 12px;
-            border-radius: 6px;
-            min-height: 22px;
-        }}
-        QListWidget#payloadList::item:hover {{
-            background: {c['panel2']};
-        }}
-        QTextEdit#log QScrollBar:vertical,
-        QTextEdit#rootOutput QScrollBar:vertical,
-        QListWidget#payloadList QScrollBar:vertical {{
-            background: transparent;
-            width: 10px;
-            margin: 3px 2px 3px 0;
-        }}
-        QTextEdit#log QScrollBar::handle:vertical,
-        QTextEdit#rootOutput QScrollBar::handle:vertical,
-        QListWidget#payloadList QScrollBar::handle:vertical {{
-            background: {c['acc2']};
-            min-height: 48px;
-            border: 2px solid transparent;
-            border-radius: 5px;
-        }}
-        QTextEdit#log QScrollBar::handle:vertical:hover,
-        QTextEdit#rootOutput QScrollBar::handle:vertical:hover,
-        QListWidget#payloadList QScrollBar::handle:vertical:hover {{
-            background: {c['acc']};
-        }}
-        QTextEdit#log QScrollBar::add-page:vertical,
-        QTextEdit#log QScrollBar::sub-page:vertical,
-        QTextEdit#rootOutput QScrollBar::add-page:vertical,
-        QTextEdit#rootOutput QScrollBar::sub-page:vertical,
-        QListWidget#payloadList QScrollBar::add-page:vertical,
-        QListWidget#payloadList QScrollBar::sub-page:vertical {{
-            background: transparent;
-        }}
-        QTextEdit#log QScrollBar::add-line:vertical,
-        QTextEdit#log QScrollBar::sub-line:vertical,
-        QTextEdit#rootOutput QScrollBar::add-line:vertical,
-        QTextEdit#rootOutput QScrollBar::sub-line:vertical,
-        QListWidget#payloadList QScrollBar::add-line:vertical,
-        QListWidget#payloadList QScrollBar::sub-line:vertical {{
-            height: 0;
-        }}
-        QTextEdit#log QScrollBar:horizontal,
-        QTextEdit#rootOutput QScrollBar:horizontal,
-        QListWidget#payloadList QScrollBar:horizontal {{
-            background: transparent;
-            height: 10px;
-            margin: 0 3px 2px 3px;
-        }}
-        QTextEdit#log QScrollBar::handle:horizontal,
-        QTextEdit#rootOutput QScrollBar::handle:horizontal,
-        QListWidget#payloadList QScrollBar::handle:horizontal {{
-            background: {c['acc2']};
-            min-width: 48px;
-            border: 2px solid transparent;
-            border-radius: 5px;
-        }}
-        QTextEdit#log QScrollBar::handle:horizontal:hover,
-        QTextEdit#rootOutput QScrollBar::handle:horizontal:hover,
-        QListWidget#payloadList QScrollBar::handle:horizontal:hover {{
-            background: {c['acc']};
-        }}
-        QTextEdit#log QScrollBar::add-page:horizontal,
-        QTextEdit#log QScrollBar::sub-page:horizontal,
-        QTextEdit#rootOutput QScrollBar::add-page:horizontal,
-        QTextEdit#rootOutput QScrollBar::sub-page:horizontal,
-        QListWidget#payloadList QScrollBar::add-page:horizontal,
-        QListWidget#payloadList QScrollBar::sub-page:horizontal {{
-            background: transparent;
-        }}
-        QScrollArea#fileScroll {{
-            background: {c['log']}; border: 1px solid {c['line']};
-            border-radius: 10px;
-        }}
-        QScrollArea#pageScroll {{ background: transparent; border: none; }}
-        QScrollArea#pageScroll > QWidget > QWidget {{ background: transparent; }}
-        QWidget#fileGrid {{ background: {c['log']}; }}
-        QFrame#fileCard {{
-            background: {c['panel']};
-            border: 1px solid {c['line']};
-            border-radius: 10px;
-        }}
-        QFrame#fileCard:hover {{
-            background: {c['panel2']};
-            border: 1px solid {c['acc2']};
-        }}
-        QFrame#fileCard[selected="true"] {{
-            background: {c['panel2']};
-            border: 2px solid {c['acc']};
-        }}
-        QLabel#fileIcon {{ font-size: 22pt; background: transparent; }}
-        QLabel#fileName {{ color: {c['text']}; font-size: 9pt; background: transparent; }}
-        QLabel#fileSize {{ color: {c['dim']}; font-size: 8pt; background: transparent; }}
-        QLabel#payloadSelectionInfo {{
-            color: {c['dim']}; background: transparent;
-            padding: 2px 8px;
-        }}
-        QLineEdit#payloadSearch {{
-            background: {c['log']}; color: {c['text']};
-            border: 1px solid {c['line']}; border-radius: 7px;
-            padding: 4px 9px;
-        }}
-        QLineEdit#payloadSearch:focus {{ border: 1px solid {c['acc']}; }}
-        QPushButton {{ border-radius: 9px; padding: 8px 18px; border: none; font-weight: bold; }}
-        QPushButton#primary {{ background: {c['acc']}; color: white; }}
-        QPushButton#primary:hover {{ background: {c['acc2']}; }}
-        QPushButton#primary:disabled {{ background: {c['line']}; color: {c['dim']}; }}
-        QPushButton#secondary {{
-            background: {c['panel2']}; color: {c['text']};
-            border: 1px solid {c['line']};
-        }}
-        QPushButton#secondary:hover {{ background: {c['line']}; border: 1px solid {c['acc']}; }}
-        QPushButton#ghost {{
-            background: transparent; color: {c['text']};
-            border: 1px solid {c['line']};
-        }}
-        QPushButton#ghost:hover {{ background: {c['panel2']}; border: 1px solid {c['acc']}; }}
-        QProgressBar {{
-            background: {c['log']}; border: 1px solid {c['line']};
-            border-radius: 5px;
-        }}
-        QProgressBar::chunk {{ background: {c['acc']}; border-radius: 5px; }}
-        QScrollBar:vertical {{ background: transparent; width: 8px; }}
-        QScrollBar::handle:vertical {{
-            background: {c['line']}; border-radius: 4px; min-height: 30px;
-        }}
-        QScrollBar::handle:vertical:hover {{ background: {c['acc']}; }}
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
-        """
+        qss = build_qss(c)
         self.setStyleSheet(qss)
         if hasattr(self, "dot"):
             self.dot.setStyleSheet(f"color: {self._dotc(self.sTxt.text())}; font-size: 16pt;")
         for k in getattr(self, "infoLabels", {}):
             lbl = self.infoLabels[k]
             self._apply_info_color(k, lbl)
+        for cb in list(getattr(self, "_theme_hooks", [])):
+            try:
+                cb()
+            except Exception:
+                pass
+        # 所有动画进度条统一跟主题（各页面无需自己处理）
+        for bar in self.findChildren(AnimatedProgressBar):
+            try:
+                bar.set_colors(c["acc"], c["log"], c["text"],
+                               c["line"], c["acc2"])
+            except Exception:
+                pass
 
     # ==================== 日志 ====================
     def lg(self, msg, level="plain"):
@@ -546,13 +386,14 @@ class MainWin(InfoPageMixin, FlashPageMixin, PatchPageMixin,
 
     def _lg(self, msg, level):
         ts = datetime.now().strftime("%H:%M:%S")
-        colors = {"info": "#60a5fa", "ok": self.theme["ok"],
-                  "warn": self.theme["warn"], "error": self.theme["err"],
-              "root": "#ff2020",
-                  "plain": self.theme["text"]}
-        col = colors.get(level, self.theme["text"])
-        html = f'<span style="color:#64748b">[{ts}]</span> ' \
-               f'<span style="color:{col}">{msg}</span>'
+        c = self.theme
+        colors = {"info": c["acc2"], "ok": c["ok"], "warn": c["warn"],
+                  "error": c["err"], "root": c["err"], "plain": c["text"]}
+        col = colors.get(level, c["text"])
+        body = (str(msg).replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;"))
+        html = (f'<span style="color:{c["dim"]}">[{ts}]</span> '
+                f'<span style="color:{col}">{body}</span>')
         self.logbox.append(html)
         sb = self.logbox.verticalScrollBar()
         sb.setValue(sb.maximum())
@@ -592,24 +433,57 @@ class MainWin(InfoPageMixin, FlashPageMixin, PatchPageMixin,
             self.lg(f"❌ 打开命令行失败：{e}", "error")
 
     # ==================== 自动检测 ====================
+    def _apply_rec_mode(self, mode, serial, detail=""):
+        """接收后台检测出的设备模式：更新右上角胶囊 + 同步给 Recovery 工具页"""
+        self.rec_mode = mode
+        text, state = REC_MODE_UI.get(mode, REC_MODE_UI["none"])
+        try:
+            set_state(self.modeLabel, state)
+            self.modeLabel.setText(text)
+            self.modeLabel.setVisible(True)
+            tip = f"设备模式：{text}"
+            if serial:
+                tip += f"\n序列号：{serial}"
+            hint = MODE_TIPS.get(mode)
+            if hint:
+                tip += f"\n{hint}"
+            if detail:
+                tip += f"\n检测依据：{detail}"
+            self.modeLabel.setToolTip(tip)
+        except Exception:
+            pass
+        if getattr(self, "_last_rec_mode", None) != mode:
+            self._last_rec_mode = mode
+            self.sig.log.emit(
+                f"设备模式：{text}" + (f"（{serial}）" if serial else ""),
+                {"ok": "ok", "warn": "warn", "err": "error"}.get(state, "info"))
+        try:
+            self._rec_sync_mode(mode, serial)
+        except Exception:
+            pass
+
     def _auto_check(self):
         def w():
-            ds, _ = adb_dev()
-            if ds:
-                cur = f"adb:{ds[0]}"
-            else:
-                fs, _ = fb_dev()
-                cur = f"fastboot:{fs[0]}" if fs else None
+            mode, serial, detail = detect_device_mode()
+            self.sig.recmode.emit(mode, serial, detail)
 
-            # ---------- 每次都刷新电量/存储/内存 ----------
-            if ds:
+            adb_ready = mode in ("system", "recovery")
+            if adb_ready:
+                cur = f"adb:{mode}:{serial}"
+            elif mode in ("sideload", "unauthorized", "offline"):
+                cur = f"{mode}:{serial}"
+            elif mode == "fastboot":
+                cur = f"fastboot:{serial}"
+            else:
+                cur = None
+
+            # ---------- 每次都刷新电量/存储/内存（有 adb shell 才有意义）----------
+            if adb_ready:
                 try:
-                    stats = read_device_stats()
-                    self.sig.stats.emit(stats)
+                    self.sig.stats.emit(read_device_stats())
                 except Exception:
                     pass
             else:
-                # 没有 ADB 设备（拔线 / fastboot）→ 清空卡片
                 self.sig.stats.emit({
                     "battery_level": None, "battery_status": "—",
                     "storage_used_pct": None, "storage_used": "—",
@@ -630,16 +504,28 @@ class MainWin(InfoPageMixin, FlashPageMixin, PatchPageMixin,
                 QTimer.singleShot(0, self.do_browse_phone)
                 return
 
-            kind, name = cur.split(":", 1)
-            if kind == "adb":
-                self.sig.dev.emit(f"● ADB: {name}", self.theme["ok"])
-                self.sig.log.emit(f"✓ 检测到设备（ADB）：{name}", "ok")
+            if mode == "system":
+                self.sig.dev.emit(f"● ADB: {serial}", self.theme["ok"])
+                self.sig.log.emit(f"✓ 检测到设备（系统模式）：{serial}", "ok")
                 QTimer.singleShot(200, self.do_browse_phone)
+            elif mode == "recovery":
+                self.sig.dev.emit(f"● Recovery: {serial}", self.theme["warn"])
+                self.sig.log.emit(f"✓ 检测到设备（Recovery 模式）：{serial}", "ok")
+                QTimer.singleShot(200, self.do_browse_phone)
+            elif mode == "sideload":
+                self.sig.dev.emit(f"● Sideload: {serial}", self.theme["ok"])
+                self.sig.log.emit(f"✓ 设备已进入 Sideload 待机：{serial}", "ok")
+            elif mode in ("unauthorized", "offline"):
+                self.sig.dev.emit(f"● {MODE_LABELS.get(mode, '未就绪')}: {serial}",
+                                  self.theme["warn"])
+                self.sig.log.emit(
+                    f"⚠ 设备未就绪（{MODE_LABELS.get(mode, mode)}）："
+                    "请在手机上点“允许 USB 调试”", "warn")
             else:
-                self.sig.dev.emit(f"● FB: {name}", self.theme["ok"])
-                self.sig.log.emit(f"✓ 检测到设备（Fastboot）：{name}", "ok")
+                self.sig.dev.emit(f"● FB: {serial}", self.theme["ok"])
+                self.sig.log.emit(f"✓ 检测到设备（Fastboot）：{serial}", "ok")
 
-            info, mode = read_device_info()
+            info, _kind = read_device_info()
             for k, v in info.items():
                 if k in self.infoLabels:
                     self.sig.info.emit(k, v)

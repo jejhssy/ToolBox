@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """页面 3：文件传输 & 预览"""
-import os, re, sys, shlex, subprocess, threading
+import os, re, sys, shlex, subprocess, threading, time       
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
@@ -12,8 +12,11 @@ from core.config import (
     WIN, FILE_KINDS,
     CARD_W, CARD_GAP_X, CARD_GAP_Y, GRID_PADDING,
 )
-from core.widgets import FileCard
-from core.utils import sh, sh_stream, adb_dev
+from core.widgets import FileCard, AnimatedProgressBar, set_state
+from core.utils import (
+    sh, sh_stream, adb_list, shq, ascii_work_dir, move_into_place,
+    has_nonascii_dirs, adb_pull_tree,
+)
 
 
 class FilesPageMixin:
@@ -103,53 +106,88 @@ class FilesPageMixin:
         self.fileStatus = QLabel("等待设备连接…")
         self.fileStatus.setObjectName("info")
         bot.addWidget(self.fileStatus, 1)
-        self.progress2 = QProgressBar()
-        self.progress2.setRange(0, 100)
-        self.progress2.setValue(0)
-        self.progress2.setFixedHeight(10)
-        self.progress2.setTextVisible(False)
-        self.progress2.setFixedWidth(200)
+        self._adb_mode = None       # 当前 adb 状态（device / recovery），由 _require_adb 刷新
+        self.progress2 = AnimatedProgressBar()
+        self.progress2.setFixedHeight(18)
+        self.progress2.setFixedWidth(320)
+        self.progress2.setFormat("空闲")
         bot.addWidget(self.progress2)
         v.addLayout(bot)
 
         return w
 
     def _set_prog2(self, val):
+        """文件传输进度：-1 = 不确定进度 → 滚动动画"""
         try:
-            if val < 0:
-                self.progress2.setRange(0, 0)
+            if val is None or val < 0:
+                self.progress2.set_busy(True, "传输中…")
             else:
-                self.progress2.setRange(0, 100)
-                self.progress2.setValue(max(0, min(100, int(val))))
+                v = max(0, min(100, int(val)))
+                self.progress2.set_smooth_value(v, f"{v}%")
         except Exception:
             pass
 
     def _require_adb(self, show_warning=True):
-        ds, _ = adb_dev()
-        if not ds:
-            if show_warning:
-                QMessageBox.warning(self, "无设备",
-                                    "未检测到 ADB 设备，请连接手机并授权 USB 调试。")
-            return None
-        return ds[0]
+        """返回可用的 adb 序列号 —— 系统模式和 Recovery 模式都能读写文件
+
+        （以前只认 adb 状态是 device，所以手机在 TWRP/Recovery 里整页都显示“未检测到设备”；
+          Recovery 下 adb shell / pull / push 其实都能用）
+        """
+        mode = None
+        serial = None
+        try:
+            rows, _ = adb_list()
+        except Exception:
+            rows = []
+        for st in ("device", "recovery"):
+            for sn, s in rows:
+                if s == st:
+                    mode, serial = st, sn
+                    break
+            if serial:
+                break
+        self._adb_mode = mode
+        if serial:
+            return serial
+
+        if show_warning:
+            other = rows[0][1] if rows else ""
+            if other == "unauthorized":
+                msg = ("设备已连接但还没授权：请在手机屏幕上点“允许 USB 调试”"
+                       "（Recovery 下也会弹）。")
+            elif other == "sideload":
+                msg = ("设备在 Sideload 模式，这个模式没有文件服务。"
+                       "请回到系统或 Recovery 模式后再用文件传输。")
+            elif other == "offline":
+                msg = "设备处于离线状态：重新插拔数据线，或在 CMD 里执行 adb kill-server 后重试。"
+            else:
+                msg = ("未检测到 ADB 设备（系统模式和 Recovery 模式都可以），"
+                       "请连接手机并授权 USB 调试。")
+            QMessageBox.warning(self, "无设备", msg)
+        return None
 
     def _file_icon(self, name, is_dir):
         if is_dir:
             return FILE_KINDS["folder"]
         n = name.lower()
-        if n.endswith((".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp")):
+        if n.endswith((".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp",
+                       ".heic", ".svg", ".ico")):
             return FILE_KINDS["image"]
-        if n.endswith((".mp4", ".mkv", ".avi", ".mov", ".webm", ".3gp")):
+        if n.endswith((".mp4", ".mkv", ".avi", ".mov", ".webm", ".3gp",
+                       ".flv", ".wmv", ".m4v")):
             return FILE_KINDS["video"]
-        if n.endswith((".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac")):
+        if n.endswith((".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac",
+                       ".opus", ".wma")):
             return FILE_KINDS["audio"]
         if n.endswith(".apk"):
             return FILE_KINDS["apk"]
-        if n.endswith((".txt", ".log", ".md", ".json", ".xml", ".ini", ".conf")):
+        if n.endswith((".txt", ".log", ".md", ".json", ".xml", ".ini",
+                       ".conf", ".yml", ".yaml", ".csv", ".html", ".htm")):
             return FILE_KINDS["text"]
-        if n.endswith((".zip", ".rar", ".7z", ".tar", ".gz")):
+        if n.endswith((".zip", ".rar", ".7z", ".tar", ".gz", ".xz",
+                       ".bz2", ".zst")):
             return FILE_KINDS["zip"]
-        if n.endswith(".img"):
+        if n.endswith((".img", ".iso", ".bin", ".raw")):
             return FILE_KINDS["img"]
         return FILE_KINDS["file"]
 
@@ -170,13 +208,15 @@ class FilesPageMixin:
         self._sel_is_dir = False
 
         if not dev:
-            self.fileStatus.setText("⚠ 未检测到设备，请连接手机并授权 USB 调试")
-            self.fileStatus.setStyleSheet(f"color: {self.theme['warn']}; background: transparent;")
+            self.fileStatus.setText("⚠ 未检测到设备，请连接手机并授权 USB 调试"
+                                    "（系统 / Recovery 模式都能读文件）")
+            set_state(self.fileStatus, "warn")
             return
 
         self.lg(f"浏览目录：{path}", "info")
-        self.fileStatus.setText(f"⏳ 正在读取 {path} …")
-        self.fileStatus.setStyleSheet(f"color: {self.theme['dim']}; background: transparent;")
+        tip = "🛡 Recovery 模式 · " if getattr(self, "_adb_mode", None) == "recovery" else ""
+        self.fileStatus.setText(f"{tip}⏳ 正在读取 {path} …")
+        set_state(self.fileStatus, "dim")
 
         def w():
             quoted = shlex.quote(path)
@@ -261,18 +301,18 @@ class FilesPageMixin:
         if not ok:
             self._clear_grid()
             self.fileStatus.setText(f"❌ 无法读取：{path}")
-            self.fileStatus.setStyleSheet(f"color: {self.theme['err']}; background: transparent;")
+            set_state(self.fileStatus, "err")
             return
         if not rows:
             self._clear_grid()
             self.fileStatus.setText(f"（空目录）{path}")
-            self.fileStatus.setStyleSheet(f"color: {self.theme['dim']}; background: transparent;")
+            set_state(self.fileStatus, "dim")
             return
 
         self._relayout_files_grid()
 
         self.fileStatus.setText(f"✓ {path}    共 {len(rows)} 项")
-        self.fileStatus.setStyleSheet(f"color: {self.theme['ok']}; background: transparent;")
+        set_state(self.fileStatus, "ok")
         self.sig.log.emit(f"[3] ✓ 已显示 {len(rows)} 项（{self._cur_cols} 列）", "ok")
 
     def _clear_grid(self):
@@ -359,18 +399,51 @@ class FilesPageMixin:
             target_dir += "/"
         name = os.path.basename(f)
         target = target_dir + name
+        # 中文/特殊名：adb 自己推导远端文件名会算成 '.'（推失败或把文件夹内容散落），
+        # 所以先推成 ASCII 临时名，推完在设备端 mv 成真名
+        ascii_name = name.isascii()
+        push_to = target if ascii_name else (
+            f"{target_dir}.tb_tmp_{int(time.time() * 1000) % 100000000}")
         self.lg(f"推送：{f} → {target}", "info")
         self.sig.prog2.emit(0)
 
         def on_text(line):
-            m = re.search(r"\[\s*(\d+)%\]", line)
+            # adb push -p 输出样式：
+            #   [ 50%] /sdcard/xxx.bin
+            #   45% /sdcard/xxx.bin
+            if not line:
+                return
+            m = re.search(r"\[\s*(\d{1,3})\s*%\]", line)
+            if not m:
+                m = re.search(r"(?:^|\s)(\d{1,3})\s*%", line)
             if m:
-                self.sig.prog2.emit(int(m.group(1)))
+                try:
+                    v = int(m.group(1))
+                    if 0 <= v <= 100:
+                        self.sig.prog2.emit(v)
+                except Exception:
+                    pass
 
         def w():
             rc, out = sh_stream(
-                ["adb", "-s", dev, "push", "-p", f, target],
+                ["adb", "-s", dev, "push", "-p", f, push_to],
                 on_text=on_text, timeout=1800)
+            if rc == 0 and not ascii_name:
+                # 设备端改名成真名，并确认真的写进去了
+                rc2, out2 = sh(["adb", "-s", dev, "shell",
+                                f"mv {shq(push_to)} {shq(target)}"], timeout=30)
+                if out2:
+                    out = (out or "") + "\n" + out2
+                rc = rc2
+                rc3, chk = sh(["adb", "-s", dev, "shell",
+                               f"test -e {shq(target)} && echo TB_OK"], timeout=15)
+                if rc == 0 and not (rc3 == 0 and "TB_OK" in (chk or "")):
+                    rc = 1
+            elif rc == 0:
+                rc2, chk = sh(["adb", "-s", dev, "shell",
+                               f"test -e {shq(target)} && echo TB_OK"], timeout=15)
+                if not (rc2 == 0 and "TB_OK" in (chk or "")):
+                    rc = 1
             for line in (out or "").splitlines():
                 if line.strip():
                     self.sig.log.emit(line, "plain")
@@ -411,25 +484,108 @@ class FilesPageMixin:
                 self, "保存到电脑", default_name, "所有文件 (*)")
             if not save_path:
                 return
-            local_target = save_path
+            final = Path(save_path)
         else:
             local_dir = QFileDialog.getExistingDirectory(self, "选择保存到电脑的目录")
             if not local_dir:
                 return
-            local_target = local_dir
+            rname = os.path.basename(phone_path.rstrip("/")) or "phone"
+            final = Path(local_dir) / rname
 
-        self.lg(f"拉取：{phone_path} → {local_target}", "info")
-        self.sig.prog2.emit(-1)
+        # adb 在本地路径含中文时会建不出文件（cannot create '…': Not a directory），
+        # 所以先拉到「同盘、纯 ASCII」的临时名，再由本程序改名到最终位置
+        work = ascii_work_dir(final)
+        pull_to = str(work / f".tb_pull_{int(time.time() * 1000) % 100000000}")
+
+        # 先取远端总大小（仅对文件；目录留空 → indeterminate）
+        total_bytes = 0
+        if is_file:
+            rc, out = sh(
+                ["adb", "-s", dev, "shell",
+                 f"stat -c %s {shlex.quote(phone_path)}"],
+                timeout=10)
+            if rc == 0 and out.strip().isdigit():
+                total_bytes = int(out.strip())
+
+        self.lg(f"拉取：{phone_path} → {final}", "info")
+        self.sig.prog2.emit(0 if total_bytes > 0 else -1)
 
         def w():
-            rc, out = sh(["adb", "-s", dev, "pull", phone_path, local_target], timeout=1800)
+            stop_flag = threading.Event()
+
+            def poll():
+                last = -1
+                target_path = Path(pull_to)
+                while not stop_flag.is_set():
+                    try:
+                        if is_file:
+                            size = target_path.stat().st_size if target_path.is_file() else 0
+                        else:
+                            size = sum(
+                                f.stat().st_size
+                                for f in target_path.rglob("*")
+                                if f.is_file())
+                    except Exception:
+                        size = 0
+                    if total_bytes > 0:
+                        pct = min(99, int(size * 100 / total_bytes))
+                        if pct != last:
+                            self.sig.prog2.emit(pct)
+                            last = pct
+                    time.sleep(0.15)
+
+            # 远端树里有非 ASCII 目录名？→ adb 会中途失败（还留下半成品），直接走混合通道
+            need_tree = (not is_file) and has_nonascii_dirs(dev, phone_path) is True
+            if need_tree:
+                self.sig.log.emit("手机上有非 ASCII 目录名（adb 建不出同名本地目录），"
+                                  "按子树导出：ASCII 子树一次拉、含中文目录名的子树逐文件…",
+                                  "info")
+            elif total_bytes > 0:
+                threading.Thread(target=poll, daemon=True).start()
+
+            if need_tree:
+                rc2, okc, failc = adb_pull_tree(
+                    dev, phone_path, final, str(work),
+                    on_progress=lambda p: self.sig.prog2.emit(p),
+                    log=lambda s: self.sig.log.emit(s, "plain"))
+                stop_flag.set()
+                if rc2 in (0, 1) and (okc or failc):
+                    self.sig.prog2.emit(100)
+                    self.sig.log.emit(
+                        f"✅ 下载完成：{final}（成功 {okc} 项"
+                        + (f"，失败 {failc} 项" if failc else "") + "）",
+                        "ok" if failc == 0 else "warn")
+                elif rc2 == 0:
+                    self.sig.prog2.emit(100)
+                    self.sig.log.emit(f"（空目录）{final}", "dim")
+                else:
+                    self.sig.prog2.emit(0)
+                    self.sig.log.emit("❌ 下载失败（无可取文件）", "error")
+                QTimer.singleShot(1200, lambda: self.sig.prog2.emit(0))
+                return
+
+            rc, out = sh(
+                ["adb", "-s", dev, "pull", phone_path, pull_to],
+                timeout=1800)
+            stop_flag.set()
             if out:
                 for line in out.splitlines():
                     self.sig.log.emit(line, "plain")
-            if rc == 0:
+            moved = False
+            if rc == 0 or os.path.isdir(pull_to):
+                moved = move_into_place(pull_to, final)
+            if rc == 0 and moved:
+                self.lg(f"  ↻ 已落地：{final}", "plain")
                 self.sig.prog2.emit(100)
-                self.sig.log.emit(f"✅ 下载完成：{local_target}", "ok")
+                self.sig.log.emit(f"✅ 下载完成：{final}", "ok")
+            elif rc == 0:
+                self.sig.prog2.emit(100)
+                self.sig.log.emit(f"✅ 下载完成（未改名）：{pull_to}", "ok")
             else:
+                if "cannot create" in (out or "").lower():
+                    self.sig.log.emit(
+                        "提示：电脑上的保存路径尽量别用中文/特殊字符，"
+                        "程序已用临时目录中转，若仍失败请换英文目录", "warn")
                 self.sig.prog2.emit(0)
                 self.sig.log.emit(f"❌ 下载失败（{rc}）", "error")
             QTimer.singleShot(1200, lambda: self.sig.prog2.emit(0))

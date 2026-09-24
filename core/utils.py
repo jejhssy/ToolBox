@@ -1,7 +1,213 @@
 # -*- coding: utf-8 -*-
 """ADB / Fastboot 命令封装、设备信息读取"""
-import re, subprocess, platform, threading
+import re, shutil, subprocess, platform, tempfile, threading
+from pathlib import Path
 from core.config import WIN
+
+
+# ==================== adb 本地/远端路径的已知坑 ====================
+def shq(path):
+    """把路径塞进 `adb shell <整串>` 时加引号
+
+    设备端 shell 会按空格拆参数，带空格 / 中文的路径必须整体引起来，
+    里面的单引号用 '\\'' 转义（POSIX 写法）。
+    """
+    return "'" + str(path).replace("'", "'\\''") + "'"
+
+
+def hsize(n):
+    """字节数转人话"""
+    try:
+        n = float(n)
+    except Exception:
+        return "—"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return "—"
+
+
+def ascii_work_dir(final_path, prefix=".tb_tmp"):
+    """找一个「路径纯 ASCII 且可写」的目录，用来放 adb 传输的临时结果
+
+    adb 在**本地路径含中文**时建文件会失败（cannot create '…': Not a directory /
+    Is a directory），所以先落到纯 ASCII 的临时名，再由本程序改名到最终位置。
+    优先取最终路径所在磁盘上离它最近的纯 ASCII 目录 —— 同盘改名是瞬间完成的。
+    """
+    cands = []
+    try:
+        cur = Path(str(final_path)).parent
+    except Exception:
+        cur = None
+    while cur is not None:
+        cands.append(cur)
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    try:
+        cands.append(Path(tempfile.gettempdir()))
+    except Exception:
+        pass
+    for c in cands:
+        try:
+            if not str(c).isascii() or not c.is_dir():
+                continue
+            probe = c / f"{prefix}_probe"
+            with open(probe, "w") as f:
+                f.write("")
+            probe.unlink()
+            return c
+        except Exception:
+            continue
+    try:
+        return Path(tempfile.gettempdir())
+    except Exception:
+        return Path(".")
+
+
+def has_nonascii_dirs(serial, remote, timeout=90):
+    """远端子树里有没有「非 ASCII 目录名」（adb 在 Windows 上建不出这种本地目录）
+
+    返回 None（拿不到清单）/ False（全 ASCII）/ True（有）
+    """
+    base = (["adb", "-s", serial] if serial else ["adb"])
+    try:
+        rc, out = sh(base + ["shell", f"find {shq(remote)} -type d -print"],
+                     timeout=timeout)
+    except Exception:
+        return None
+    if rc != 0:
+        return None
+    return any(l.strip() and not l.strip().isascii()
+               for l in (out or "").splitlines())
+
+
+def adb_pull_tree(serial, remote, target, work,
+                  on_file=None, on_progress=None, cancel=None, log=None):
+    """把远端目录拉到 target（本程序负责建本地目录）
+
+    · 纯 ASCII 的顶层子项：一次 adb pull（快）
+    · 含非 ASCII 目录名的子项：逐文件拉（单一文件的中文名 adb 能建，目录名不行）
+    返回 (rc, 成功文件数, 失败文件数)，rc：0 全成功 / 1 有失败 / -100 已取消
+    """
+    base = (["adb", "-s", serial] if serial else ["adb"])
+    remote = str(remote).rstrip("/")
+
+    def _log(msg):
+        if log:
+            try:
+                log(msg)
+            except Exception:
+                pass
+
+    rc, out = sh(base + ["shell", f"ls -1Ap {shq(remote)}"], timeout=60)
+    if rc != 0:
+        return rc, 0, 0
+    children = []
+    for line in (out or "").splitlines():
+        n = line.strip().replace("\r", "")
+        if not n or n.startswith("ls:") or n.startswith("adb:"):
+            continue
+        is_dir = n.endswith("/")
+        children.append((n[:-1] if is_dir else n, is_dir))
+    if not children:
+        return 0, 0, 0
+
+    total = len(children)
+    ok = fail = 0
+    for ci, (name, is_dir) in enumerate(children):
+        if cancel is not None and cancel.is_set():
+            return -100, ok, fail
+        dst = Path(target) / name
+        if not is_dir:
+            tmp = Path(work) / f".tb_c_{ci}"
+            rc2, _o = sh(base + ["pull", f"{remote}/{name}", str(tmp)], timeout=1800)
+            if rc2 == 0 and move_into_place(tmp, dst):
+                ok += 1
+            else:
+                fail += 1
+                _log(f"  ↑ 跳过：{name}")
+        elif not has_nonascii_dirs(serial, f"{remote}/{name}") is True:
+            # 子树没有中文目录名 → 一次拉下来（快）
+            tmp = Path(work) / f".tb_c_{ci}"
+            rc2, _o = sh(base + ["pull", "-p", f"{remote}/{name}", str(tmp)],
+                         timeout=3600)
+            if rc2 == 0 and move_into_place(tmp, dst):
+                ok += 1
+            elif tmp.exists():
+                move_into_place(tmp, dst)
+                fail += 1
+                _log(f"  ⚠ 子目录中途出错，已保留已传内容：{name}")
+            else:
+                fail += 1
+                _log(f"  ↑ 跳过：{name}")
+        else:
+            # 子树里有中文目录名 → 逐文件
+            _log(f"  ↳ 「{name}」里有非 ASCII 目录名，改为逐文件拉取")
+            rc3, out3 = sh(base + ["shell",
+                                   f"find {shq(f'{remote}/{name}')} -type f -print"],
+                           timeout=180)
+            files = [l.strip() for l in (out3 or "").splitlines() if l.strip()]
+            for fi, rf in enumerate(files):
+                if cancel is not None and cancel.is_set():
+                    return -100, ok, fail
+                rel = rf[len(f"{remote}/{name}"):].lstrip("/") or Path(rf).name
+                if on_file:
+                    try:
+                        on_file(ci + 1, total, f"{name}/{rel}")
+                    except Exception:
+                        pass
+                tmp = Path(work) / f".tb_c{ci}_f{fi}"
+                rc4, _o = sh(base + ["pull", rf, str(tmp)], timeout=1800)
+                if rc4 == 0 and tmp.exists():
+                    d2 = dst.joinpath(*rel.split("/"))
+                    try:
+                        d2.parent.mkdir(parents=True, exist_ok=True)
+                    except Exception:
+                        pass
+                    if move_into_place(tmp, d2):
+                        ok += 1
+                    else:
+                        fail += 1
+                else:
+                    fail += 1
+                    _log(f"  ↑ 跳过：{rf}")
+        if on_progress:
+            try:
+                on_progress(int((ci + 1) * 100 / max(1, total)))
+            except Exception:
+                pass
+    return (0 if fail == 0 else 1), ok, fail
+
+
+def move_into_place(src, dst):
+    """把临时传输结果改名 / 合并到最终位置（跨盘自动退化成复制）"""
+    src, dst = Path(str(src)), Path(str(dst))
+    try:
+        if not src.exists():
+            return False
+        if not dst.exists():
+            try:
+                src.replace(dst)
+            except OSError:
+                shutil.move(str(src), str(dst))
+            return True
+        if src.is_dir() and dst.is_dir():
+            shutil.copytree(str(src), str(dst), dirs_exist_ok=True)
+            shutil.rmtree(str(src), ignore_errors=True)
+            return True
+        i = 1
+        while i < 999:
+            cand = dst.with_name(f"{dst.stem} ({i}){dst.suffix}")
+            if not cand.exists():
+                src.replace(cand)
+                return True
+            i += 1
+    except Exception:
+        pass
+    return False
+
 
 
 def sh(cmd, timeout=30):
@@ -26,15 +232,15 @@ def sh(cmd, timeout=30):
 
 
 def sh_stream(cmd, on_text=None, timeout=1800):
-    """实时读取子进程输出（含 \r 进度行），逐行回调 on_text(line)"""
+    """实时读取子进程输出（\r / \n 都作为分帧符），逐帧回调 on_text(text)"""
+    import os
     try:
         kw = {}
         if WIN:
             kw["creationflags"] = subprocess.CREATE_NO_WINDOW
         p = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace",
-            bufsize=1, **kw)
+            bufsize=0, **kw)
     except FileNotFoundError:
         return -1, f"未找到 {cmd[0]}（请安装并加入 PATH）"
     except Exception as e:
@@ -54,18 +260,38 @@ def sh_stream(cmd, on_text=None, timeout=1800):
 
     threading.Thread(target=_watchdog, daemon=True).start()
 
-    buf = []
-    try:
-        for line in p.stdout:
-            line = line.rstrip("\r\n")
-            buf.append(line)
+    lines = []
+    pending = bytearray()
+
+    def emit_pending():
+        if not pending:
+            return
+        try:
+            s = bytes(pending).decode("utf-8", errors="replace")
+        except Exception:
+            s = ""
+        pending.clear()
+        if s:
+            lines.append(s)
             if on_text:
                 try:
-                    on_text(line)
+                    on_text(s)
                 except Exception:
                     pass
+
+    try:
+        while True:
+            chunk = os.read(p.stdout.fileno(), 4096)
+            if not chunk:
+                break
+            for b in chunk:
+                if b in (10, 13):        # \n 或 \r
+                    emit_pending()
+                else:
+                    pending.append(b)
     except Exception:
         pass
+    emit_pending()
 
     try:
         p.wait(timeout=10)
@@ -77,7 +303,27 @@ def sh_stream(cmd, on_text=None, timeout=1800):
 
     if flag["timeout"]:
         return -2, f"命令超时：{' '.join(cmd)}"
-    return (p.returncode if p.returncode is not None else -1), "\n".join(buf)
+    return (p.returncode if p.returncode is not None else -1), "\n".join(lines)
+
+
+def adb_list():
+    """列出 adb 里的所有设备，返回 [(serial, state), ...]
+
+    state 可能是：device / recovery / sideload / unauthorized / offline / bootloader
+    （adb_dev() 只认 device，识别不出 recovery、sideload 这些特殊状态）
+    """
+    rc, out = sh(["adb", "devices"])
+    if rc != 0:
+        return [], out
+    rows = []
+    for line in out.splitlines()[1:]:
+        line = line.strip()
+        if not line or line.startswith("*"):
+            continue
+        p = line.split()
+        if len(p) >= 2:
+            rows.append((p[0], p[1]))
+    return rows, out
 
 
 def adb_dev():
@@ -93,6 +339,34 @@ def adb_dev():
         if len(p) >= 2 and p[1] == "device":
             ds.append(p[0])
     return ds, out
+
+
+# adb 的哪些状态可以直接用 adb shell / pull / push / reboot
+# （Recovery 下 adb 服务照样在，命令能跑；Sideload 只有侧载通道，没有 shell）
+ADB_SHELL_STATES = ("device", "recovery")
+
+
+def adb_state():
+    """当前 adb 状态：device / recovery / sideload / unauthorized / offline / none"""
+    rows, _ = adb_list()
+    for st in ("sideload", "recovery", "device", "unauthorized", "offline"):
+        if any(s == st for _sn, s in rows):
+            return st
+    return "none"
+
+
+def adb_shell_dev():
+    """返回能用 adb shell / pull / push / reboot 的序列号（系统 或 Recovery 模式）
+
+    Recovery（TWRP 等）下 adb reboot / adb shell / adb push 都是可用的，
+    所以别再只认 device —— 否则手机在 Recovery 里点“重启到系统”会报“未检测到设备”。
+    """
+    rows, _ = adb_list()
+    for st in ADB_SHELL_STATES:
+        for sn, s in rows:
+            if s == st:
+                return sn
+    return None
 
 
 def fb_dev():
@@ -136,6 +410,86 @@ def _pretty_soc_vendor(v):
     return s
 
 
+def _probe_adb_shell(serial):
+    """device 状态下进一步分清是「系统」还是「Recovery」"""
+    def g(prop):
+        rc, out = sh(["adb", "-s", serial, "shell", "getprop", prop], timeout=8)
+        return (out or "").strip().lower() if rc == 0 else ""
+
+    bootmode = g("ro.bootmode") or g("ro.boot.bootmode") or g("ro.boot.mode")
+    svc = g("init.svc.recovery")
+    booted = g("sys.boot_completed")
+    ramdisk = ""
+    try:
+        rc, out = sh(["adb", "-s", serial, "shell",
+                      "test -e /sbin/recovery && echo REC_RAMDISK"], timeout=8)
+        if rc == 0 and "REC_RAMDISK" in (out or ""):
+            ramdisk = "有"
+    except Exception:
+        pass
+
+    detail = (f"ro.bootmode={bootmode or '(空)'} · "
+              f"init.svc.recovery={svc or '(空)'} · "
+              f"sys.boot_completed={booted or '(空)'}")
+    if ramdisk:
+        detail += " · /sbin/recovery=存在"
+    if ("recovery" in bootmode) or (svc == "running") or bool(ramdisk):
+        return "recovery", detail
+    return "system", detail
+
+
+def detect_device_mode(fastboot_check=True):
+    """判断设备当前处于哪种模式，返回 (mode, serial, detail)
+
+    mode：none / system / recovery / sideload / fastboot / unauthorized / offline
+    （adb 1.0.41+ 会直接把 recovery / sideload 写在状态列里；
+      老版本只写 device，这里再用 getprop / /sbin/recovery 兜底判断）
+    """
+    rows, _ = adb_list()
+    mode, serial = "none", None
+    for st in ("sideload", "recovery", "unauthorized", "offline", "device"):
+        for sn, s in rows:
+            if s == st:
+                mode, serial = st, sn
+                break
+        if serial:
+            break
+
+    if mode == "device":
+        m, detail = _probe_adb_shell(serial)
+        return m, serial, detail
+    if mode == "none" and fastboot_check:
+        try:
+            fs, _ = fb_dev()
+            if fs:
+                return "fastboot", fs[0], ""
+        except Exception:
+            pass
+    return mode, serial, ""
+
+
+# 模式 → 展示名（主页「连接类型」和右上角都用这套叫法）
+MODE_LABELS = {
+    "none": "未连接", "system": "系统", "recovery": "Recovery",
+    "sideload": "Sideload", "fastboot": "Fastboot",
+    "unauthorized": "未授权", "offline": "离线",
+}
+
+# 模式 → 该模式下能做什么（右上角胶囊的 tooltip 用）
+MODE_TIPS = {
+    "none": "插好数据线，确认手机已开启 USB 调试，并在弹窗里点“允许”",
+    "system": "可以导出相册、推送文件；要刷 OTA 先重启到 Recovery，"
+              "在手机里选 “Apply update from ADB”",
+    "recovery": "可以 Sideload 刷机 / 导出相册 / 推送文件；"
+                "导出前建议先在手机 Recovery 里挂载 /sdcard",
+    "sideload": "设备已就绪：在「🛠 Recovery 工具」里选好 OTA zip 直接开始侧载",
+    "fastboot": "该模式下 ADB 功能（Sideload / 导出 / 推送）都用不了；"
+                "要回系统请去「📦 常规镜像刷入」页点重启",
+    "unauthorized": "请在手机屏幕上点“允许 USB 调试”（Recovery 下也会弹）",
+    "offline": "重新插拔数据线；或在 CMD 里执行 adb kill-server 后重试",
+}
+
+
 def read_device_info():
     info = {
         "state": "未连接", "mode": "—",
@@ -144,11 +498,22 @@ def read_device_info():
         "slot": "—", "soc_vendor": "—", "platform": "—", "soc_model": "—",
         "host_os": _host_os(), "selinux": "—",
     }
-    ds, _ = adb_dev()
+    mode, serial, _ = detect_device_mode(fastboot_check=False)
+    if mode == "sideload":
+        info["state"] = "已连接"
+        info["mode"] = "Sideload（等待侧载包）"
+        info["serial"] = serial or "—"
+        return info, "adb"
+    if mode in ("unauthorized", "offline"):
+        info["state"] = "已连接（未就绪）"
+        info["mode"] = MODE_LABELS.get(mode, "—")
+        info["serial"] = serial or "—"
+        return info, None
+    ds = [serial] if (mode in ("system", "recovery") and serial) else []
     if ds:
         dev = ds[0]
         info["state"] = "已连接"
-        info["mode"] = "系统"
+        info["mode"] = "系统" if mode == "system" else "Recovery"
 
         rc, out = sh(["adb", "-s", dev, "shell", "getprop"], timeout=10)
         props = {}

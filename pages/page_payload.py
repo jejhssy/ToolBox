@@ -1,962 +1,873 @@
 # -*- coding: utf-8 -*-
-"""页面 5：Payload / 本地 OTA 提取（调用外部 payload-dumper-go.exe）
+"""页面：Payload 可视化（本地）
 
-流程：
-    ① 选择本地 OTA ZIP / payload.bin
-  ② 点「🔍 读取分区表」→ 列表出现分区
-  ③ 勾选 → 点「📤 提取选中」
-  ④ 任何时刻点「⏹ 停止」立即中断
-
-后端工具（自动查找）：
-    · payload-dumper-go.exe   ← 推荐（支持本地 ZIP / payload.bin）
-
-查找顺序：PATH → 项目根目录 → tools/ 子目录
+设计参考 VioletToolBox 的「Payload 可视化」面板，但**全部本地化**：
+  · 只读本地 payload.bin / 全量包 ZIP / 7z，不联网
+  · 先展示概览信息（版本、包类型、block_size、时间戳、安全补丁、动态分区、APEX…）
+  · 分区表可视化（勾选 + 大小 + 操作数 + 备注），双击看操作分布
+  · 按需提取所选分区；普通压缩包（无 payload.bin）也能列目录并提取
+解析内核：core/payload_parser.py（纯 Python，无需外部工具）
 """
-import re, shutil, subprocess, threading, time
+import os
+import shutil
+import threading
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
 try:
     import py7zr
-except ImportError:
+except ImportError:          # 7z 支持可选
     py7zr = None
 
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
-    QLineEdit, QProgressBar, QMessageBox, QFileDialog,
-    QListWidget, QListWidgetItem, QAbstractItemView,
-    QStyledItemDelegate, QStyleOptionViewItem,
+    QLineEdit, QMessageBox, QFileDialog,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+    QTextEdit, QFrame,
 )
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QColor, QPen, QBrush
-from core.config import WIN, OUT_DIR
+from PyQt6.QtGui import QColor, QBrush
+
+from core.config import OUT_DIR
+from core.widgets import CheckCellDelegate, RowTintDelegate, AnimatedProgressBar, \
+    set_state, state_from_color
+from core.payload_parser import (
+    PayloadParser, PayloadExtractor, PayloadError, ExtractionCancelled,
+)
+
+ARCHIVE_SUFFIXES = (".zip", ".7z")
 
 
-PROG_RE = re.compile(r"(\d+)\s*%")
-NAME_OK = re.compile(r"^[A-Za-z0-9_\-]+$")
-_ACTIVE_PROCESSES = set()
-_ACTIVE_PROCESSES_LOCK = threading.Lock()
+class _ZipPayloadSource:
+    """直接从 zip 里随机读取 payload.bin（仅未压缩条目）
 
+    OTA 包里的 payload.bin 通常是 STORED（内容本身已压缩），
+    这样可以省掉"把几 GB 解到磁盘再读回来"的步骤。
+    """
 
-class PayloadItemDelegate(QStyledItemDelegate):
-    def __init__(self, theme, parent=None):
-        super().__init__(parent)
-        self.theme = theme
+    def __init__(self, zip_path, entry):
+        self._zf = zipfile.ZipFile(zip_path)
+        info = self._zf.getinfo(entry)
+        self._fh = self._zf.open(entry)
+        self.name = Path(entry).name
+        self.size = int(info.file_size)
 
-    def paint(self, painter, option, index):
-        option = QStyleOptionViewItem(option)
-        checked = index.data(Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked
-        if checked:
-            option.backgroundBrush = QBrush(QColor(self.theme["acc"]).darker(150))
-        super().paint(painter, option, index)
-        color = QColor(self.theme["acc"]) if checked else QColor(self.theme["line"])
-        pen = QPen(color, 2 if checked else 1)
-        painter.save()
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(option.rect.adjusted(2, 2, -3, -3), 6, 6)
-        painter.restore()
+    def read(self, n=-1):
+        return self._fh.read(n)
 
+    def seek(self, pos, whence=0):
+        return self._fh.seek(pos, whence)
 
-# ===================== 外部工具调用 =====================
-def _run_cli(cmd, cancel_event=None, on_text=None):
-    """运行外部命令，支持取消。返回 (returncode, text)。
-       cancel_event 触发 → kill 子进程，返回 -100。"""
-    kw = {}
-    if WIN:
-        kw["creationflags"] = subprocess.CREATE_NO_WINDOW
-    try:
-        p = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kw)
-    except FileNotFoundError:
-        return -1, f"未找到 {cmd[0]}"
-    except Exception as e:
-        return -3, f"启动失败：{e}"
-    with _ACTIVE_PROCESSES_LOCK:
-        _ACTIVE_PROCESSES.add(p)
+    def tell(self):
+        return self._fh.tell()
 
-    def terminate():
-        if WIN and p.pid:
-            subprocess.run(
-                ["taskkill", "/PID", str(p.pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        else:
+    def close(self):
+        for obj in (self._fh, self._zf):
             try:
-                p.kill()
+                obj.close()
             except Exception:
                 pass
 
-    # 看门狗：cancel 触发时即使线程卡在 read() 里也能杀进程
-    if cancel_event is not None:
-        def _watch():
-            while p.poll() is None:
-                if cancel_event.is_set():
-                    terminate()
-                    return
-                time.sleep(0.15)
-        threading.Thread(target=_watch, daemon=True).start()
 
-    output = bytearray()
-
-    def collect_output():
-        try:
-            for line in iter(p.stdout.readline, b""):
-                output.extend(line)
-                if on_text:
-                    on_text(line.decode("utf-8", errors="replace").rstrip("\r\n"))
-        except Exception:
-            pass
-
-    reader = threading.Thread(target=collect_output, daemon=True)
-    reader.start()
-    while p.poll() is None:
-        if cancel_event is not None and cancel_event.is_set():
-            terminate()
-            break
-        time.sleep(0.05)
-    try:
-        p.wait(timeout=5)
-    except Exception:
-        terminate()
-        try:
-            p.wait(timeout=2)
-        except Exception:
-            pass
-    reader.join(timeout=5)
-
-    all_bytes = bytes(output)
-    if reader.is_alive():
-        terminate()
-    with _ACTIVE_PROCESSES_LOCK:
-        _ACTIVE_PROCESSES.discard(p)
-
-    if cancel_event is not None and cancel_event.is_set():
-        return -100, all_bytes.decode("utf-8", errors="replace")
-    rc = p.returncode if p.returncode is not None else 0
-    return rc, all_bytes.decode("utf-8", errors="replace")
-
-
-def _find_tool():
-    """返回本地 payload-dumper-go 路径。"""
-    names = [
-        ("payload-dumper-go.exe", "pdg"),
-        ("payload-dumper-go", "pdg"),
-    ]
-    # 1. PATH
-    for n, k in names:
-        p = shutil.which(n)
-        if p:
-            return p, k
-    # 2. 项目根 / tools
-    here = Path(__file__).resolve().parent.parent   # 项目根
-    for d in (here, here / "tools", Path.cwd(), Path.cwd() / "tools"):
-        for n, k in names:
-            f = d / n
-            if f.exists():
-                return str(f), k
-    return None, None
-
-
-def _find_xz():
-    found = shutil.which("xz") or shutil.which("xz.exe")
-    if found:
-        return found
-    here = Path(__file__).resolve().parent.parent
-    for directory in (here, here / "tools"):
-        for name in ("xz.exe", "xz"):
-            candidate = directory / name
-            if candidate.exists():
-                return str(candidate)
-    return None
-
-
-def _validate_local_source(path):
-    """验证本地文件可读取；ZIP 是否包含 payload.bin 由读取阶段分流。"""
-    source = Path(path)
-    if not source.is_file():
-        return "文件不存在"
-    try:
-        if source.suffix.lower() == ".zip":
-            with zipfile.ZipFile(source) as package:
-                package.namelist()
-        elif source.suffix.lower() == ".7z":
-            if py7zr is None:
-                return "读取 7z 需要安装 py7zr：pip install py7zr"
-            with py7zr.SevenZipFile(source, mode="r") as package:
-                package.getnames()
-        elif source.suffix.lower() == ".bin":
-            with source.open("rb") as stream:
-                if stream.read(4) != b"CrAU":
-                    return "BIN 文件不是有效的 payload.bin"
-        return None
-    except zipfile.BadZipFile:
-        return "ZIP 文件损坏或格式无效"
-    except OSError as exc:
-        return f"无法读取文件：{exc}"
-
-
-def _zip_entries(path):
-    """返回普通 ZIP 内的文件条目；目录不加入列表。"""
-    entries = []
-    with zipfile.ZipFile(path) as package:
-        for item in package.infolist():
-            if item.is_dir():
-                continue
-            entries.append((item.filename, f"{item.file_size} bytes"))
-    return entries
-
-
-def _archive_entries(path):
-    source = Path(path)
-    if source.suffix.lower() == ".7z":
-        if py7zr is None:
-            raise RuntimeError("读取 7z 需要安装 py7zr")
-        with py7zr.SevenZipFile(source, mode="r") as package:
-            return [(name, "") for name in package.getnames()]
-    return _zip_entries(source)
-
-
-def _archive_contains_payload(path):
-    source = Path(path)
-    if source.suffix.lower() == ".7z":
-        if py7zr is None:
-            return False
-        with py7zr.SevenZipFile(source, mode="r") as package:
-            names = package.getnames()
-    else:
-        with zipfile.ZipFile(source) as package:
-            names = package.namelist()
-    return any(str(name).replace("\\", "/").rstrip("/").split("/")[-1].lower()
-               == "payload.bin" for name in names)
-
-
-def _parse_list_output(text):
-    """解析 payload-dumper-go 的普通和机器可读分区列表输出。"""
-    parts = []
-    seen = set()
-    for line in text.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-
-        # payload-dumper-go -m -l: name:size_in_KB
-        machine = re.match(r"^([A-Za-z0-9_\-]+)\s*:\s*(\d+)\s*$", s)
-        if machine:
-            entries = [(machine.group(1), f"{machine.group(2)} KB")]
-        else:
-            # Human output: name (size), possibly several entries on one line.
-            entries = [
-                (m.group(1), m.group(2))
-                for m in re.finditer(
-                    r"([A-Za-z0-9_\-]+)\s*\(([^)]+)\)", s)]
-            if not entries and "\t" in s:
-                cols = [c.strip() for c in s.split("\t") if c.strip()]
-                if len(cols) >= 2:
-                    entries = [(cols[0], cols[1])]
-
-        for name, size_r in entries:
-            if name in seen:
-                continue
-            seen.add(name)
-            parts.append((name, size_r))
-    return parts
-
-
-def _is_payload_like_source(value):
-    """判断本地路径是否具有 payload 文件扩展名。"""
-    if value is None:
-        return False
-    s = str(value).strip().lower()
-    if not s:
-        return False
-    if s.startswith(("http://", "https://")):
-        return False
-
-    blocked = (".tar.gz", ".tgz", ".tar", ".exe", ".msi")
-    if any(s.endswith(ext) for ext in blocked):
-        return False
-
-    ok_suffixes = (".zip", ".7z", ".bin", ".img", ".payload")
-    if any(s.endswith(ext) for ext in ok_suffixes):
-        return True
-
-    return False
-
-
-def _tool_log_name(tool_path):
-    return "[pdg]"
-
-
-# ===================== 页面 =====================
 class PayloadPageMixin:
 
+    # ================================================================
+    # 页面构建
+    # ================================================================
     def _page_payload(self):
         w = QWidget()
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(10)
 
-        t = QLabel("📦  Payload / 链接提取")
+        t = QLabel("🧩  Payload 可视化（本地）")
         t.setObjectName("cardTitle")
         v.addWidget(t)
-        d = QLabel("① 选择本地卡刷包或 payload 文件  ② 读取分区表  ③ 勾选分区后提取")
+        d = QLabel("读取本地 payload.bin / 全量包 ZIP / 7z，查看分区信息并按需提取。"
+                   "点任意一行即可勾选 / 取消。全程本地，不联网。")
         d.setObjectName("desc")
+        d.setWordWrap(True)
         v.addWidget(d)
 
-        # ---- 源输入 ----
-        srcRow = QHBoxLayout()
-        srcRow.setSpacing(8)
-        self.payloadUrlE = QLineEdit()
-        self.payloadUrlE.setPlaceholderText("输入本地 payload.bin 或 OTA ZIP 路径…")
-        self.payloadUrlE.setFixedHeight(40)
-        self.payloadUrlE.returnPressed.connect(self.do_payload_read)
-        srcRow.addWidget(self.payloadUrlE, 1)
+        # ---- 源文件 ----
+        r1 = QHBoxLayout()
+        r1.setSpacing(8)
+        r1.addWidget(self._label("源"))
+        self.plSrcE = QLineEdit()
+        self.plSrcE.setReadOnly(True)
+        self.plSrcE.setPlaceholderText("选择 payload.bin、OTA 全量包 .zip 或 .7z")
+        self.plSrcE.setFixedHeight(40)
+        r1.addWidget(self.plSrcE, 1)
+        self.plPickBtn = QPushButton("📂  本地文件")
+        self.plPickBtn.setObjectName("secondary")
+        self.plPickBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.plPickBtn.setFixedHeight(40)
+        self.plPickBtn.setFixedWidth(130)
+        self.plPickBtn.clicked.connect(self.do_pl_pick)
+        r1.addWidget(self.plPickBtn)
+        self.plReadBtn = QPushButton("🔍  读取信息")
+        self.plReadBtn.setObjectName("primary")
+        self.plReadBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.plReadBtn.setFixedHeight(40)
+        self.plReadBtn.setFixedWidth(130)
+        self.plReadBtn.clicked.connect(self.do_pl_read)
+        r1.addWidget(self.plReadBtn)
+        v.addLayout(r1)
 
-        self.payloadLocalBtn = QPushButton("📂  本地文件")
-        self.payloadLocalBtn.setObjectName("secondary")
-        self.payloadLocalBtn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.payloadLocalBtn.setFixedHeight(44)
-        self.payloadLocalBtn.setFixedWidth(150)
-        self.payloadLocalBtn.clicked.connect(self.do_payload_pick_local)
-        srcRow.addWidget(self.payloadLocalBtn)
+        # ---- 概览信息 ----
+        infoCard = QFrame()
+        infoCard.setObjectName("card")
+        iv = QVBoxLayout(infoCard)
+        iv.setContentsMargins(12, 8, 12, 8)
+        iv.setSpacing(4)
+        self.plInfo = QTextEdit()
+        self.plInfo.setObjectName("log")
+        self.plInfo.setReadOnly(True)
+        self.plInfo.setFixedHeight(150)
+        self.plInfo.setPlaceholderText("payload 概览信息会显示在这里（版本 / 包类型 / 时间戳 / 安全补丁 …）")
+        iv.addWidget(self.plInfo)
+        v.addWidget(infoCard)
 
-        self.payloadReadBtn = QPushButton("🔍  读取分区表")
-        self.payloadReadBtn.setObjectName("primary")
-        self.payloadReadBtn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.payloadReadBtn.setFixedHeight(44)
-        self.payloadReadBtn.setFixedWidth(160)
-        self.payloadReadBtn.clicked.connect(self.do_payload_read)
-        srcRow.addWidget(self.payloadReadBtn)
-
-        self.payloadStopBtn = QPushButton("⏹  停止")
-        self.payloadStopBtn.setObjectName("secondary")
-        self.payloadStopBtn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.payloadStopBtn.setFixedHeight(44)
-        self.payloadStopBtn.setFixedWidth(96)
-        self.payloadStopBtn.setEnabled(False)
-        self.payloadStopBtn.clicked.connect(self.do_payload_stop)
-        srcRow.addWidget(self.payloadStopBtn)
-        v.addLayout(srcRow)
-
-        self.payloadInfo = QLabel("尚未载入任何内容")
-        self.payloadInfo.setObjectName("info")
-        self.payloadInfo.setWordWrap(True)
-        v.addWidget(self.payloadInfo)
-
-        # ---- 列表头 ----
-        head = QHBoxLayout()
-        head.setSpacing(6)
-        head.addWidget(self._label("分区列表"))
-        self.payloadSelectionInfo = QLabel("已选 0 项")
-        self.payloadSelectionInfo.setObjectName("payloadSelectionInfo")
-        head.addWidget(self.payloadSelectionInfo)
-        self.payloadSearchE = QLineEdit()
-        self.payloadSearchE.setObjectName("payloadSearch")
-        self.payloadSearchE.setPlaceholderText("搜索分区…")
-        self.payloadSearchE.setClearButtonEnabled(True)
-        self.payloadSearchE.setFixedHeight(30)
-        self.payloadSearchE.setFixedWidth(190)
-        self.payloadSearchE.textChanged.connect(self._payload_filter_items)
-        head.addWidget(self.payloadSearchE)
-        head.addStretch()
-        for text, cb in (
-            ("全选", lambda: self._payload_check_all(True)),
-            ("取消", lambda: self._payload_check_all(False)),
-            ("反选", self._payload_invert),
-        ):
+        # ---- 分区表工具行 ----
+        r2 = QHBoxLayout()
+        r2.setSpacing(8)
+        r2.addWidget(self._label("分区列表"))
+        self.plSelLb = QLabel("已选 0 项")
+        self.plSelLb.setObjectName("info")
+        r2.addWidget(self.plSelLb)
+        # 剩余空间放在这里 → 左边的文字标签永远不会被挤到裁切
+        r2.addStretch(1)
+        self.plSearchE = QLineEdit()
+        self.plSearchE.setPlaceholderText("搜索分区…")
+        self.plSearchE.setClearButtonEnabled(True)
+        self.plSearchE.setFixedHeight(30)
+        self.plSearchE.setFixedWidth(200)
+        self.plSearchE.textChanged.connect(self._pl_filter)
+        r2.addWidget(self.plSearchE)
+        for text, cb in (("全选", lambda: self._pl_check_all(True)),
+                         ("取消", lambda: self._pl_check_all(False)),
+                         ("反选", self._pl_invert),
+                         ("仅全量", self._pl_select_full_only)):
             b = QPushButton(text)
-            b.setObjectName("ghost")
+            b.setObjectName("ghostSmall")
             b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.setFixedHeight(32)
-            b.setFixedWidth(64)
+            b.setFixedHeight(30)
+            # 不写死宽度：按文字自适应，避免"仅全量"这种较长文字被截断
+            b.setMinimumWidth(64)
             b.clicked.connect(cb)
-            head.addWidget(b)
-        v.addLayout(head)
+            r2.addWidget(b)
+        v.addLayout(r2)
 
-        self.payloadList = QListWidget()
-        self.payloadList.setObjectName("payloadList")
-        self.payloadList.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.payloadList.setMinimumHeight(300)
-        self.payloadList.setSpacing(3)
-        self.payloadList.setAlternatingRowColors(False)
-        self.payloadList.setItemDelegate(PayloadItemDelegate(self.theme, self.payloadList))
-        self.payloadList.itemPressed.connect(self._payload_on_item_pressed)
-        self.payloadList.itemClicked.connect(self._payload_on_item_clicked)
-        self.payloadList.itemChanged.connect(self._payload_on_item_changed)
-        v.addWidget(self.payloadList, 1)
+        # ---- 分区表 ----
+        self.plTable = QTableWidget()
+        self.plTable.setObjectName("oplusTable")
+        self.plTable.setColumnCount(5)
+        self.plTable.setHorizontalHeaderLabels(
+            ["选择", "名称", "大小", "操作数", "备注"])
+        hh = self.plTable.horizontalHeader()
+        hh.setFixedHeight(32)
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        hh.resizeSection(0, 80)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        hh.resizeSection(1, 190)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        hh.resizeSection(2, 110)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        hh.resizeSection(3, 70)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.plTable.verticalHeader().setVisible(False)
+        self.plTable.verticalHeader().setDefaultSectionSize(36)
+        self.plTable.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.plTable.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.plTable.setAlternatingRowColors(True)
+        self.plTable.setShowGrid(False)
+        self.plTable.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self.plTable.setMinimumHeight(210)
+        # ---- 自绘"选择"列：大号圆角勾选框（默认小勾太不显眼）----
+        self._pl_check_delegate = CheckCellDelegate(
+            self.plTable, self.theme["acc"], self.theme["line"],
+            self.theme["log"], self.theme["acc2"], self.theme["dim"],
+            self.theme["ok"])
+        self.plTable.setItemDelegateForColumn(0, self._pl_check_delegate)
+        # 其它列：委托负责把"勾选行"的整行底色铺满（QSS 会吃掉 BackgroundRole）
+        self._pl_row_delegate = RowTintDelegate(self.plTable)
+        self.plTable.setItemDelegate(self._pl_row_delegate)
+        self.plTable.itemChanged.connect(self._pl_on_item_changed)
+        self.plTable.cellClicked.connect(self._pl_on_cell_clicked)
+        self.plTable.itemDoubleClicked.connect(self._pl_show_detail)
+        v.addWidget(self.plTable, 1)
 
-        # ---- 输出 ----
-        outRow = QHBoxLayout()
-        outRow.setSpacing(8)
-        outRow.addWidget(self._label("输出目录"))
-        self.payloadOutE = QLineEdit(str(Path(OUT_DIR) / "extracted"))
-        self.payloadOutE.setFixedHeight(36)
-        outRow.addWidget(self.payloadOutE, 1)
+        # ---- 输出 / 进度 ----
+        r3 = QHBoxLayout()
+        r3.setSpacing(8)
+        r3.addWidget(self._label("输出目录"))
+        self.plOutE = QLineEdit(str(Path(OUT_DIR) / "extracted"))
+        self.plOutE.setFixedHeight(36)
+        r3.addWidget(self.plOutE, 1)
+        self.plOutBtn = QPushButton("📁  选择")
+        self.plOutBtn.setObjectName("secondary")
+        self.plOutBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.plOutBtn.setFixedHeight(36)
+        self.plOutBtn.setFixedWidth(90)
+        self.plOutBtn.clicked.connect(self._pl_pick_outdir)
+        r3.addWidget(self.plOutBtn)
+        self.plExtractBtn = QPushButton("📤  提取选中")
+        self.plExtractBtn.setObjectName("primary")
+        self.plExtractBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.plExtractBtn.setFixedHeight(36)
+        self.plExtractBtn.setMinimumWidth(150)   # 文案带数量会变长 → 用最小宽自适应
+        self.plExtractBtn.setEnabled(False)
+        self.plExtractBtn.clicked.connect(self.do_pl_extract)
+        r3.addWidget(self.plExtractBtn)
+        self.plStopBtn = QPushButton("⏹  停止")
+        self.plStopBtn.setObjectName("secondary")
+        self.plStopBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.plStopBtn.setFixedHeight(36)
+        self.plStopBtn.setFixedWidth(90)
+        self.plStopBtn.setEnabled(False)
+        self.plStopBtn.clicked.connect(self.do_pl_stop)
+        r3.addWidget(self.plStopBtn)
+        v.addLayout(r3)
 
-        self.payloadOutBtn = QPushButton("📁  选择")
-        self.payloadOutBtn.setObjectName("secondary")
-        self.payloadOutBtn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.payloadOutBtn.setFixedHeight(36)
-        self.payloadOutBtn.setFixedWidth(90)
-        self.payloadOutBtn.clicked.connect(self._payload_pick_outdir)
-        outRow.addWidget(self.payloadOutBtn)
+        r4 = QHBoxLayout()
+        r4.setSpacing(10)
+        self.plStatus = QLabel("等待选择文件…")
+        self.plStatus.setObjectName("info")
+        r4.addWidget(self.plStatus, 1)
+        self.plStageLb = QLabel("")          # 当前正在处理的分区
+        self.plStageLb.setObjectName("hint")
+        r4.addWidget(self.plStageLb)
+        v.addLayout(r4)
 
-        self.payloadExtractBtn = QPushButton("📤  提取选中")
-        self.payloadExtractBtn.setObjectName("primary")
-        self.payloadExtractBtn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.payloadExtractBtn.setFixedHeight(36)
-        self.payloadExtractBtn.setFixedWidth(140)
-        self.payloadExtractBtn.setEnabled(False)
-        self.payloadExtractBtn.clicked.connect(self.do_payload_extract)
-        outRow.addWidget(self.payloadExtractBtn)
-        v.addLayout(outRow)
+        # 进度条：单独一行、铺满宽度、条内显示百分比（比原来那一小条明显）
+        self.plProg = AnimatedProgressBar()
+        self.plProg.setFixedHeight(22)
+        self.plProg.setFormat("空闲")
+        self.plProg.set_colors(self.theme["acc"], self.theme["log"],
+                               self.theme["text"], self.theme["line"],
+                               self.theme["acc2"])
+        v.addWidget(self.plProg)
 
-        # ---- 状态 / 进度 ----
-        progRow = QHBoxLayout()
-        progRow.setSpacing(10)
-        self.payloadStatus = QLabel("等待操作…")
-        self.payloadStatus.setObjectName("info")
-        progRow.addWidget(self.payloadStatus, 1)
-
-        self.payloadProg = QProgressBar()
-        self.payloadProg.setRange(0, 100)
-        self.payloadProg.setValue(0)
-        self.payloadProg.setFixedHeight(10)
-        self.payloadProg.setTextVisible(False)
-        self.payloadProg.setFixedWidth(220)
-        progRow.addWidget(self.payloadProg)
-        v.addLayout(progRow)
-
-        # 内部状态
-        self._payload_src_kind = None       # "local"
-        self._payload_src_value = None
-        self._payload_cancel = threading.Event()
-        self._payload_token = 0
-        self._payload_busy = False          # 读取 或 提取 中
-        self._payload_partitions = []       # [(name, size_str), ...]
-        self._payload_archive_mode = False  # 普通 ZIP 只展示内容
+        # ---- 内部状态 ----
+        self._pl_src = ""            # 源文件路径
+        self._pl_payload_path = ""   # 真正的 payload.bin（zip/7z 时是临时解出的）
+        self._pl_src_reader = None   # zip 直读句柄（未压缩的 payload.bin）
+        self._pl_parser = None
+        self._pl_archive_mode = False
+        self._pl_rows = []           # [(name, size_str, ops, note, payload_part)]
+        self._pl_busy = False
+        self._pl_cancel = threading.Event()
+        self._pl_temp_dir = None
+        self._pl_work = None
+        # 自绘控件（勾选框 / 进度条 / 行配色）需要随主题刷新
+        self._theme_hooks = getattr(self, "_theme_hooks", [])
+        self._theme_hooks.append(self._pl_refresh_colors)
         return w
 
-    # ====================== 状态工具 ======================
-    def _payload_set_prog(self, val):
+    # ================================================================
+    # 基础工具
+    # ================================================================
+    def _pl_log(self, msg, level="plain"):
         try:
-            if val < 0:
-                self.payloadProg.setRange(0, 0)
+            self.lg(msg, level)
+        except Exception:
+            pass
+
+    def _pl_set_prog(self, val, busy_text="处理中…"):
+        """val < 0 → 未知进度（滚动动画）；否则 0~100 平滑推进并显示百分比"""
+        try:
+            if val is None or val < 0:
+                self.plProg.set_busy(True, busy_text)
             else:
-                self.payloadProg.setRange(0, 100)
-                self.payloadProg.setValue(max(0, min(100, int(val))))
+                v = max(0, min(100, int(val)))
+                self.plProg.set_smooth_value(v, f"{v}%")
         except Exception:
             pass
 
-    def _payload_set_status(self, text, color=None):
+    def _pl_stage(self, name):
+        """显示当前正在处理的分区"""
         try:
-            self.payloadStatus.setText(text)
-            if color is None:
-                color = self.theme["dim"]
-            self.payloadStatus.setStyleSheet(
-                f"color: {color}; background: transparent;")
+            self.plStageLb.setText(f"当前：{name}" if name else "")
         except Exception:
             pass
 
-    def _payload_pick_outdir(self):
-        d = QFileDialog.getExistingDirectory(self, "选择输出目录")
-        if d:
-            self.payloadOutE.setText(d)
+    def _pl_progress_ui(self, val):
+        """提取过程中的动态反馈：进度条 + 状态文字"""
+        if not self._pl_busy:
+            return                      # 任务已结束，忽略迟到的进度事件
+        self._pl_set_prog(val)
+        if 0 <= val < 100:
+            self._pl_set_status(f"⏳ 正在提取 … {int(val)}%", self.theme["warn"])
 
-    def _ui_if_current(self, token, fn):
-        def _wrapped():
-            if self._payload_token == token:
-                fn()
-        self.sig.ui.emit(_wrapped)
-
-    # ====================== 勾选视觉 ======================
-    def _payload_apply_item_style(self, it):
+    def _pl_refresh_colors(self):
+        """主题切换后刷新自绘控件（QSS 管不到的部分）"""
+        c = self.theme
         try:
-            checked = it.checkState() == Qt.CheckState.Checked
-            f = it.font()
-            f.setBold(checked)
-            it.setFont(f)
-            if checked:
-                bg = QColor(self.theme["acc"]).darker(150)
-                it.setBackground(bg)
-                it.setForeground(QColor("#ffffff"))
-            else:
-                it.setBackground(QColor(self.theme["log"]))
-                it.setForeground(QColor(self.theme["dim"]))
+            self.plProg.set_colors(c["acc"], c["log"], c["text"],
+                                   c["line"], c["acc2"])
+        except Exception:
+            pass
+        try:
+            self._pl_check_delegate.set_colors(c["acc"], c["line"], c["log"],
+                                               c["acc2"], c["dim"], c["ok"])
+            self.plTable.viewport().update()
+        except Exception:
+            pass
+        try:
+            self._pl_apply_row_style()
         except Exception:
             pass
 
-    def _payload_check_all(self, checked):
-        self.payloadList.blockSignals(True)
-        for i in range(self.payloadList.count()):
-            it = self.payloadList.item(i)
-            if it.isHidden():
-                continue
-            it.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
-        self.payloadList.blockSignals(False)
-        for i in range(self.payloadList.count()):
-            self._payload_apply_item_style(self.payloadList.item(i))
-        self._payload_update_extract_btn()
+    def _pl_set_status(self, text, color=None):
+        try:
+            self.plStatus.setText(text)
+            set_state(self.plStatus, state_from_color(self.theme, color))
+        except Exception:
+            pass
 
-    def _payload_invert(self):
-        self.payloadList.blockSignals(True)
-        for i in range(self.payloadList.count()):
-            it = self.payloadList.item(i)
-            if it.isHidden():
-                continue
-            cur = it.checkState()
-            it.setCheckState(Qt.CheckState.Unchecked
-                             if cur == Qt.CheckState.Checked else Qt.CheckState.Checked)
-        self.payloadList.blockSignals(False)
-        for i in range(self.payloadList.count()):
-            self._payload_apply_item_style(self.payloadList.item(i))
-        self._payload_update_extract_btn()
+    def _pl_set_info(self, lines):
+        try:
+            self.plInfo.setPlainText("\n".join(lines))
+        except Exception:
+            pass
 
-    def _payload_checked_names(self):
+    # ---- 表格 ----
+    def _pl_fill_table(self, rows):
+        """rows: [(名称, 大小文本, 操作数, 备注)]"""
+        self.plTable.blockSignals(True)
+        self.plTable.setRowCount(0)
+        for name, size_s, ops, note in rows:
+            r = self.plTable.rowCount()
+            self.plTable.insertRow(r)
+            chk = QTableWidgetItem()
+            # 必须带 ItemIsSelectable：否则整行选中时这一格不算"被选中"，
+            # 高亮大横条会在勾选框这里断开（右边有、勾选列没有）
+            chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable
+                         | Qt.ItemFlag.ItemIsEnabled
+                         | Qt.ItemFlag.ItemIsSelectable)
+            chk.setCheckState(Qt.CheckState.Unchecked)
+            self.plTable.setItem(r, 0, chk)
+            for col, text in ((1, name), (2, size_s), (3, str(ops)), (4, note)):
+                it = QTableWidgetItem(text)
+                it.setForeground(QColor(self.theme["dim"] if col == 4
+                                        else self.theme["text"]))
+                self.plTable.setItem(r, col, it)
+        self.plTable.blockSignals(False)
+        self._pl_rows = rows
+        self._pl_update_sel()
+
+    def _pl_on_item_changed(self, _item):
+        self._pl_update_sel()
+
+    def _pl_on_cell_clicked(self, row, col):
+        """点表格里任意位置都能勾选/取消（不必非得点准那个方框）"""
+        if col == 0:
+            return                      # 第 0 列由自绘委托处理，避免被翻两次
+        it = self.plTable.item(row, 0)
+        if it is None:
+            return
+        it.setCheckState(Qt.CheckState.Unchecked
+                         if it.checkState() == Qt.CheckState.Checked
+                         else Qt.CheckState.Checked)
+
+    def _pl_checked_names(self):
         out = []
-        for i in range(self.payloadList.count()):
-            it = self.payloadList.item(i)
-            if it.checkState() == Qt.CheckState.Checked:
-                out.append(it.data(Qt.ItemDataRole.UserRole))
+        for r in range(self.plTable.rowCount()):
+            it = self.plTable.item(r, 0)
+            nm = self.plTable.item(r, 1)
+            if it and nm and it.checkState() == Qt.CheckState.Checked:
+                out.append(nm.text())
         return out
 
-    def _payload_update_extract_btn(self, *_):
-        checked_count = sum(
-            self.payloadList.item(i).checkState() == Qt.CheckState.Checked
-            for i in range(self.payloadList.count()))
-        if self._payload_archive_mode:
-            self.payloadSelectionInfo.setText(
-                f"普通压缩包 · {self.payloadList.count()} 个文件")
-        else:
-            self.payloadSelectionInfo.setText(f"已选 {checked_count} 项")
-        self.payloadExtractBtn.setText(
-            f"📤  提取选中 ({checked_count})")
-        self.payloadExtractBtn.setEnabled(self.payloadList.count() > 0)
+    def _pl_update_sel(self):
+        n = len(self._pl_checked_names())
+        total = self.plTable.rowCount()
+        self.plSelLb.setText(f"已选 {n}/{total} 项")
+        self.plExtractBtn.setEnabled(n > 0 and not self._pl_busy)
+        self.plExtractBtn.setText(f"📤  提取选中 ({n})" if n else "📤  提取选中")
+        self._pl_apply_row_style()
 
-    def _payload_on_item_changed(self, it):
-        self._payload_apply_item_style(it)
-        self._payload_update_extract_btn()
+    def _pl_apply_row_style(self):
+        """勾选的行：整行绿色浅底（含"选择"列）+ 名称加粗，让"已选"一眼可见
 
-    def _payload_on_item_pressed(self, it):
-        self._payload_press_state = it.checkState()
+        绿色 = 已选（和整行点选时的蓝色高亮条区分开）。
+        注意：QSS 的 QTableWidget::item 规则会让 Qt 忽略 BackgroundRole，
+        第 0 列由自绘委托补画这一层底色（见 CheckCellDelegate.paint）。
+        """
+        c = self.theme
+        tint = QColor(c["ok"])
+        tint.setAlpha(62)                        # 比之前更明显：勾选后是一条完整横条
+        on_brush = QBrush(tint)
+        off_brush = QBrush(Qt.BrushStyle.NoBrush)
+        for r in range(self.plTable.rowCount()):
+            chk = self.plTable.item(r, 0)
+            on = bool(chk) and chk.checkState() == Qt.CheckState.Checked
+            # 第 0 列（自绘勾选框）也要铺底，否则高亮横条会缺一块
+            if chk is not None:
+                chk.setBackground(on_brush if on else off_brush)
+            for col in range(1, self.plTable.columnCount()):
+                it = self.plTable.item(r, col)
+                if it is None:
+                    continue
+                it.setBackground(on_brush if on else off_brush)
+                f = it.font()
+                f.setBold(on)
+                it.setFont(f)
+                it.setForeground(QColor(c["dim"] if (col == 4 and not on)
+                                        else c["text"]))
+        try:
+            self.plTable.viewport().update()
+        except Exception:
+            pass
 
-    def _payload_on_item_clicked(self, it):
-        if getattr(self, "_payload_press_state", None) == it.checkState():
-            it.setCheckState(
-                Qt.CheckState.Unchecked
-                if it.checkState() == Qt.CheckState.Checked
-                else Qt.CheckState.Checked)
-        self._payload_press_state = None
+    def _pl_check_all(self, checked):
+        self.plTable.blockSignals(True)
+        for r in range(self.plTable.rowCount()):
+            it = self.plTable.item(r, 0)
+            if it:
+                it.setCheckState(Qt.CheckState.Checked if checked
+                                 else Qt.CheckState.Unchecked)
+        self.plTable.blockSignals(False)
+        self._pl_update_sel()
 
-    def _payload_filter_items(self, text):
-        query = (text or "").strip().casefold()
-        for i in range(self.payloadList.count()):
-            item = self.payloadList.item(i)
-            item.setHidden(bool(query) and query not in item.text().casefold())
+    def _pl_invert(self):
+        self.plTable.blockSignals(True)
+        for r in range(self.plTable.rowCount()):
+            it = self.plTable.item(r, 0)
+            if it:
+                it.setCheckState(Qt.CheckState.Unchecked
+                                 if it.checkState() == Qt.CheckState.Checked
+                                 else Qt.CheckState.Checked)
+        self.plTable.blockSignals(False)
+        self._pl_update_sel()
 
-    def _payload_clear_list(self):
-        self._payload_archive_mode = False
-        self.payloadSearchE.clear()
-        self.payloadList.blockSignals(True)
-        self.payloadList.clear()
-        self.payloadList.blockSignals(False)
-        self.payloadExtractBtn.setEnabled(False)
-        self.payloadSelectionInfo.setText("已选 0 项")
-        self.payloadExtractBtn.setText("📤  提取选中 (0)")
+    def _pl_select_full_only(self):
+        """只勾选「全量·可提取」的分区（增量分区不勾）"""
+        self.plTable.blockSignals(True)
+        for r in range(self.plTable.rowCount()):
+            it = self.plTable.item(r, 0)
+            note = self.plTable.item(r, 4)
+            if not it:
+                continue
+            ok = bool(note) and not note.text().startswith(("增量", "⚠"))
+            it.setCheckState(Qt.CheckState.Checked if ok else Qt.CheckState.Unchecked)
+        self.plTable.blockSignals(False)
+        self._pl_update_sel()
+        self._pl_log("已按「仅全量」勾选（增量分区无法提取，已跳过）", "info")
 
-    def _payload_add_item(self, display, payload, checked=False):
-        it = QListWidgetItem(display)
-        it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-        it.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
-        it.setData(Qt.ItemDataRole.UserRole, payload)
-        self.payloadList.addItem(it)
-        return it
+    def _pl_filter(self, text):
+        q = (text or "").strip().casefold()
+        for r in range(self.plTable.rowCount()):
+            nm = self.plTable.item(r, 1)
+            hit = (not q) or (q in (nm.text().casefold() if nm else ""))
+            self.plTable.setRowHidden(r, not hit)
 
-    def _payload_end_batch(self):
-        for i in range(self.payloadList.count()):
-            self._payload_apply_item_style(self.payloadList.item(i))
-        self._payload_update_extract_btn()
-
-    # ====================== 忙碌状态 ======================
-    def _payload_start_busy(self):
-        self._payload_token += 1
-        self._payload_cancel = threading.Event()
-        self._payload_busy = True
-        self.payloadReadBtn.setEnabled(False)
-        self.payloadStopBtn.setEnabled(True)
-        self.payloadLocalBtn.setEnabled(False)
-        self.payloadExtractBtn.setEnabled(False)
-        self._payload_set_prog(-1)
-        return self._payload_token, self._payload_cancel
-
-    def _payload_end_busy(self, token):
-        if self._payload_token != token:
+    def _pl_show_detail(self, item):
+        """双击某行 → 输出该分区/条目的详情"""
+        r = item.row()
+        nm = self.plTable.item(r, 1)
+        if not nm:
             return
-        self._payload_busy = False
-        self.payloadReadBtn.setEnabled(True)
-        self.payloadStopBtn.setEnabled(False)
-        self.payloadLocalBtn.setEnabled(True)
-        self._payload_cancel = threading.Event()
-        self._payload_update_extract_btn()
-        self._payload_set_prog(0)
-
-    # ====================== 停止 ======================
-    def do_payload_stop(self):
-        if not self._payload_busy:
+        name = nm.text()
+        if self._pl_archive_mode:
+            self._pl_log(f"压缩包条目：{name}", "info")
             return
-        self.sig.log.emit("⏹ 正在停止 …", "warn")
-        self._payload_cancel.set()
-        with _ACTIVE_PROCESSES_LOCK:
-            processes = list(_ACTIVE_PROCESSES)
-        for process in processes:
-            try:
-                if WIN and process.pid:
-                    subprocess.run(
-                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=False,
-                    )
-                else:
-                    process.kill()
-            except Exception:
-                pass
-        self.payloadStopBtn.setEnabled(False)
-        self._payload_set_status("⏹ 正在停止 …", self.theme["warn"])
-
-    # ====================== 选择本地 ======================
-    def do_payload_pick_local(self):
-        if self._payload_busy:
-            self._payload_cancel.set()
-            self.sig.log.emit("⏹ 当前任务正在取消，不能切换到本地文件", "warn")
-            self._payload_set_status("⏹ 当前任务正在取消…", self.theme["warn"])
+        parts = self._pl_parser.manifest.partitions if self._pl_parser else []
+        part = next((p for p in parts if p.name == name), None)
+        if part is None:
             return
+        self._pl_log("─" * 50, "plain")
+        for line in self._pl_parser.partition_detail_lines(part):
+            self._pl_log("   " + line, "plain")
 
+    def _pl_pick_outdir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择输出目录")
+        if d:
+            self.plOutE.setText(d)
+
+    # ================================================================
+    # 读取流程
+    # ================================================================
+    def do_pl_pick(self):
         f, _ = QFileDialog.getOpenFileName(
-            self, "选择文件", "",
-            "Payload / 压缩包 (*.zip *.7z *.bin *.img *.payload);;所有文件 (*)")
+            self, "选择 payload.bin / OTA 全量包", "",
+            "Payload / 压缩包 (*.bin *.payload *.zip *.7z *.img);;所有文件 (*)")
         if not f:
             return
+        self.plSrcE.setText(f)
+        self._pl_log(f"已选择：{f}", "info")
+        QTimer.singleShot(50, self.do_pl_read)
 
-        if not _is_payload_like_source(f):
-            QMessageBox.warning(
-                self, "不是 payload 文件",
-                "当前选择的不是 payload.bin / zip / .img 这类有效载荷文件。\n\n"
-                "请重新选择 payload.bin、*.zip 或对应分区包文件；\n"
-                "不要选 tar.gz / .tar / .exe 这类工具包。")
+    def do_pl_read(self):
+        src = self.plSrcE.text().strip()
+        if not src or not Path(src).is_file():
+            QMessageBox.warning(self, "未选择文件",
+                                "请先选择 payload.bin 或 OTA 全量包（zip/7z）。")
             return
-
-        error = _validate_local_source(f)
-        if error:
-            QMessageBox.warning(self, "无法读取文件", error)
+        if self._pl_busy:
+            QMessageBox.information(self, "正在处理", "上一个任务还没结束。")
             return
+        if self._pl_temp_dir:
+            shutil.rmtree(self._pl_temp_dir, ignore_errors=True)
+            self._pl_temp_dir = None
+        self._pl_src = src
+        self._pl_archive_mode = False
+        self._pl_parser = None
+        self._pl_payload_path = ""
+        self._pl_release_src()          # 关掉上一次的 zip 直读句柄
+        self._pl_fill_table([])
+        self._pl_set_info([])
+        self._pl_busy = True
+        self._pl_cancel = threading.Event()
+        self.plReadBtn.setEnabled(False)
+        self.plPickBtn.setEnabled(False)
+        self.plStopBtn.setEnabled(True)
+        self._pl_set_prog(-1)
+        self._pl_set_status("🔍 正在读取 …", self.theme["warn"])
+        self._pl_log("═" * 60, "plain")
+        self._pl_log(f"📖 读取：{Path(src).name}", "info")
+        threading.Thread(target=self._pl_read_worker, args=(src,),
+                         daemon=True).start()
 
-        self.payloadUrlE.clear()
-        self._payload_src_kind = "local"
-        self._payload_src_value = f
-        QTimer.singleShot(50, self.do_payload_read)
-
-    # ====================== 读取入口 ======================
-    def do_payload_read(self):
-        if self._payload_busy:
-            self._payload_cancel.set()
-            self.sig.log.emit("⏹ 正在读取中，忽略重复触发", "warn")
-            self._payload_set_status("⏹ 当前任务正在取消…", self.theme["warn"])
-            return
-
-        source_text = self.payloadUrlE.text().strip()
-
-        if source_text:
-            if source_text.startswith(("http://", "https://")):
-                QMessageBox.information(
-                    self, "不支持远程读取",
-                    "当前页面只读取本地文件。请先把 OTA ZIP 下载到电脑，再点击「本地文件」选择。")
-                return
-            if not _is_payload_like_source(source_text):
-                QMessageBox.warning(
-                    self, "不是 payload 文件",
-                    "请选择本地 payload.bin、OTA ZIP 或对应的本地载荷文件。")
-                return
-            error = _validate_local_source(source_text)
-            if error:
-                QMessageBox.warning(self, "无法读取文件", error)
-                return
-            self._payload_src_kind = "local"
-            self._payload_src_value = source_text
-        elif self._payload_src_value:
-            self._payload_src_kind = self._payload_src_kind or "local"
-        else:
-            QMessageBox.information(
-                self, "未提供来源",
-                "请输入本地文件路径，或点击「📂 本地文件」选择 OTA ZIP / payload.bin。")
-            return
-
-        # 找工具
-        tool, kind = _find_tool()
-        if not tool:
-            self.sig.log.emit("❌ 未找到 payload-dumper-go.exe", "error")
-            self.sig.log.emit(
-                "   请把 payload-dumper-go.exe 放到项目根目录或 tools/ 子目录", "info")
-            QMessageBox.critical(
-                self, "缺少工具",
-                "未找到 payload-dumper-go.exe。\n\n"
-                "请把 payload-dumper-go.exe 放到：\n"
-                "  · 项目根目录\n"
-                "  · tools/ 子目录\n"
-                "  · 或加入系统 PATH")
-            return
-
-        self._payload_clear_list()
-        self._payload_partitions = []
-
-        token, cancel = self._payload_start_busy()
-        self.lg(f"读取分区表：{self._payload_src_value}", "info")
-        self._payload_set_status("🔍 正在读取分区表 …", self.theme["warn"])
-
-        threading.Thread(
-            target=self._read_worker_safe,
-            args=(token, cancel, tool, self._payload_src_value),
-            daemon=True).start()
-
-    def _read_worker_safe(self, token, cancel, tool, src):
+    def _pl_read_worker(self, src):
         try:
-            self._read_worker(token, cancel, tool, src)
-        except Exception as exc:
-            self.sig.log.emit(f"❌ 读取异常：{exc}", "error")
-            self._ui_if_current(token,
-                lambda: self._read_finish(token, False, "读取异常"))
+            suffix = Path(src).suffix.lower()
+            payload_path = src
 
-    def _read_worker(self, token, cancel, tool, src):
-        # 本地文件先检查存在
-        if not Path(src).exists():
-            self.sig.log.emit(f"❌ 文件不存在：{src}", "error")
-            self._ui_if_current(token,
-                lambda: self._read_finish(token, False, "文件不存在"))
-            return
+            if suffix in ARCHIVE_SUFFIXES:
+                name = self._pl_find_in_archive(src)
+                if not name:
+                    entries = self._pl_list_archive(src)
+                    self._pl_archive_mode = True
+                    rows = [(n, sz, "", "压缩包文件") for n, sz in entries]
 
-        if Path(src).suffix.lower() in (".zip", ".7z") \
-            and not _archive_contains_payload(src):
-            try:
-                entries = _archive_entries(src)
-            except Exception as exc:
-                self.sig.log.emit(f"❌ 压缩包读取失败：{exc}", "error")
-                self._ui_if_current(token,
-                    lambda: self._read_finish(token, False, "压缩包读取失败"))
-                return
+                    def fill_arch():
+                        self._pl_set_info([
+                            f"文件：{Path(src).name}",
+                            f"大小：{self._pl_hsize(Path(src).stat().st_size)}",
+                            "普通压缩包（未找到 payload.bin）",
+                            f"条目数：{len(rows)}",
+                            "可勾选条目后点「提取选中」解出文件",
+                        ])
+                        self._pl_fill_table(rows)
+                        self._pl_set_status(f"✓ 压缩包共 {len(rows)} 个文件（无 payload.bin）",
+                                            self.theme["ok"])
+                    self._pl_log("压缩包内没有 payload.bin，已按普通压缩包列出文件", "warn")
+                    self.sig.ui.emit(fill_arch)
+                    return
 
-            self._payload_partitions = entries
-            self._payload_archive_mode = True
+                # 能直读就直读（zip 里未压缩的 payload.bin），省掉解压几个 GB
+                reader = self._pl_open_zip_payload(src, name)
+                if reader is not None:
+                    self._pl_src_reader = reader
+                    payload_path = reader
+                    self._pl_log(
+                        f"✓ 直接从压缩包读取 payload.bin"
+                        f"（{self._pl_hsize(reader.size)}，无需解压）", "ok")
+                else:
+                    work = self._pl_make_work()
+                    target = work / "payload.bin"
+                    self._pl_log(f"从压缩包提取 payload.bin（内部路径：{name}）…",
+                                 "info")
+                    self._pl_set_status("📦 正在解出 payload.bin …",
+                                        self.theme["warn"])
+                    self._pl_extract_from_archive(src, name, target)
+                    payload_path = str(target)
+                    self._pl_temp_dir = str(work)
+                    self._pl_log(f"✓ payload.bin 已解出：{target}", "ok")
 
-            def fill_archive():
-                self.payloadInfo.setText(
-                    f"📦 {src}\n   普通压缩包，共 {len(entries)} 个文件（没有 payload.bin）")
-                self.payloadInfo.setStyleSheet(
-                    f"color: {self.theme['text']}; background: transparent;")
-                self.payloadList.blockSignals(True)
-                for name, size_r in entries:
-                    self._payload_add_item(name, name)
-                self.payloadList.blockSignals(False)
-                self._payload_end_batch()
-                self._read_finish(token, True,
-                    f"✓ ZIP 读取成功：{len(entries)} 个文件")
+            self._pl_log(f"解析：{getattr(payload_path, 'name', payload_path)}",
+                         "info")
+            parser = PayloadParser(payload_path)
+            self._pl_payload_path = payload_path
+            self._pl_parser = parser
+            self._pl_log(parser.describe(), "info")
+            rows = []
+            broken = []
+            for p in parser.manifest.partitions:
+                st = parser.partition_stats(p)
+                if p.size:
+                    size_txt = self._pl_hsize(p.size)
+                else:
+                    size_txt = "未知"          # 清单里没记录大小（不是 0M）
+                rows.append((p.name, size_txt, st["ops"],
+                             parser.partition_note(p)))
+                if not p.has_ops():
+                    broken.append(p.name)
+            info = parser.info_lines()
 
-            self._ui_if_current(token, fill_archive)
-            return
+            # 解析不到操作的分区：直接打印原始字段，便于定位厂商变体格式
+            if broken:
+                self._pl_log(
+                    f"⚠ 有 {len(broken)} 个分区解析不到操作记录："
+                    + "、".join(broken[:8]), "warn")
+                for name in broken[:3]:
+                    for line in parser.debug_fields(name):
+                        self._pl_log("   " + line, "plain")
+            for w in parser.manifest.parse_warnings[:5]:
+                self._pl_log(f"⚠ {w}", "warn")
 
-        cmd = [tool, "-m", "-l", src]
-        self.sig.log.emit(f"执行：{' '.join(cmd)}", "plain")
+            def fill():
+                self._pl_set_info(info)
+                self._pl_fill_table(rows)
+                if broken:
+                    self._pl_set_status(
+                        f"⚠ 读取完成：{len(rows)} 个分区，其中 {len(broken)} 个无法提取",
+                        self.theme["warn"])
+                else:
+                    self._pl_set_status(f"✓ 读取成功：共 {len(rows)} 个分区",
+                                        self.theme["ok"])
+            self.sig.ui.emit(fill)
+        except PayloadError as e:
+            self._pl_log(f"❌ 读取失败：{e}", "error")
+            self.sig.ui.emit(lambda m=str(e): self._pl_set_status(
+                f"❌ {m}", self.theme["err"]))
+        except ExtractionCancelled:
+            self._pl_log("⏹ 已停止", "warn")
+        except Exception as e:
+            self._pl_log(f"❌ 异常：{e}", "error")
+        finally:
+            self.sig.ui.emit(self._pl_finish)
 
-        def on_text(line):
-            s = (line or "").rstrip()
-            if s:
-                self.sig.log.emit(f"{_tool_log_name(tool)} {s}", "plain")
+    # ================================================================
+    # 压缩包 / 工作目录 / 收尾
+    # ================================================================
+    @staticmethod
+    def _pl_hsize(n):
+        try:
+            n = int(n)
+        except Exception:
+            return "—"
+        if n >= 1024 ** 3:
+            return f"{n / 1024**3:.2f} GB"
+        if n >= 1024 ** 2:
+            return f"{n / 1024**2:.1f} MB"
+        if n >= 1024:
+            return f"{n / 1024:.1f} KB"
+        return f"{n} B"
 
-        rc, out = _run_cli(cmd, cancel_event=cancel, on_text=on_text)
+    def _pl_make_work(self):
+        """解出 payload.bin 的工作目录：桌面\\VioletTmp\\Payload_时间戳（与脱机修补一致）"""
+        try:
+            desktop = Path(os.environ.get("USERPROFILE") or str(Path.home())) / "Desktop"
+        except Exception:
+            desktop = Path.home()
+        work = desktop / "VioletTmp" / f"Payload_{datetime.now():%Y%m%d_%H%M%S}"
+        try:
+            work.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            work = Path(OUT_DIR) / "payload_work"
+            work.mkdir(parents=True, exist_ok=True)
+        self._pl_work = work
+        return work
 
-        if rc == -100:
-            self.sig.log.emit("⏹ 读取已停止", "warn")
-            self._ui_if_current(token,
-                lambda: self._read_cancelled(token))
-            return
-
-        if rc != 0:
-            self.sig.log.emit(f"❌ 工具返回码 {rc}", "error")
-            self._ui_if_current(token,
-                lambda: self._read_finish(token, False, f"工具返回码 {rc}"))
-            return
-
-        parts = _parse_list_output(out)
-        if not parts:
-            self.sig.log.emit("⚠ 未从输出中解析出任何分区", "warn")
-            self.sig.log.emit(f"原始输出：{out[:1000]}", "plain")
-            self._ui_if_current(token,
-                lambda: self._read_finish(token, False, "未解析出分区"))
-            return
-
-        self._payload_partitions = parts
-
-        def fill():
-            self.payloadInfo.setText(
-                f"📦 {src}\n   共 {len(parts)} 个分区（payload）")
-            self.payloadInfo.setStyleSheet(
-                f"color: {self.theme['text']}; background: transparent;")
-            self.payloadList.blockSignals(True)
-            for name, size_r in parts:
-                display = f"{name}.img    （{size_r}）" if size_r else f"{name}.img"
-                self._payload_add_item(display, name)
-            self.payloadList.blockSignals(False)
-            self._payload_end_batch()
-            self._read_finish(token, True,
-                f"✓ 读取成功：{len(parts)} 个分区")
-        self._ui_if_current(token, fill)
-
-    def _read_finish(self, token, ok, msg):
-        self._payload_end_busy(token)
-        if ok:
-            self._payload_set_status(msg, self.theme["ok"])
-            self.lg(msg, "ok")
+    def _pl_find_in_archive(self, src):
+        """在 zip/7z 里查找 payload.bin，返回内部路径或 None"""
+        s = Path(src)
+        if s.suffix.lower() == ".7z":
+            if py7zr is None:
+                raise PayloadError("读取 7z 需要安装 py7zr：pip install py7zr")
+            with py7zr.SevenZipFile(s, mode="r") as z:
+                names = z.getnames()
         else:
-            self._payload_set_status(f"❌ {msg}", self.theme["err"])
-            self.lg(f"❌ {msg}", "error")
+            with zipfile.ZipFile(s) as z:
+                names = z.namelist()
+        for n in names:
+            if n.replace("\\", "/").lower().endswith("payload.bin"):
+                return n
+        return None
 
-    def _read_cancelled(self, token):
-        self._payload_end_busy(token)
-        self._payload_set_status("⏹ 已停止", self.theme["warn"])
+    @staticmethod
+    def _pl_open_zip_payload(src, entry):
+        """zip 内未压缩的 payload.bin → 直接随机读；压缩过或失败 → None（走解压）"""
+        try:
+            with zipfile.ZipFile(src) as z:
+                if z.getinfo(entry).compress_type != zipfile.ZIP_STORED:
+                    return None
+            return _ZipPayloadSource(src, entry)
+        except Exception:
+            return None
 
-    # ====================== 提取 ======================
-    def do_payload_extract(self):
-        if not self._payload_partitions:
-            QMessageBox.warning(self, "无内容", "请先读取分区表。")
-            return
-        names = self._payload_checked_names()
+    def _pl_release_src(self):
+        """释放上一次的直读句柄"""
+        r = getattr(self, "_pl_src_reader", None)
+        if r is not None:
+            try:
+                r.close()
+            except Exception:
+                pass
+        self._pl_src_reader = None
+
+    def _pl_list_archive(self, src):
+        s = Path(src)
+        if s.suffix.lower() == ".7z":
+            if py7zr is None:
+                raise PayloadError("读取 7z 需要安装 py7zr：pip install py7zr")
+            with py7zr.SevenZipFile(s, mode="r") as z:
+                return [(n, "—") for n in z.getnames()]
+        out = []
+        with zipfile.ZipFile(s) as z:
+            for it in z.infolist():
+                if it.is_dir():
+                    continue
+                out.append((it.filename, self._pl_hsize(it.file_size)))
+        return out
+
+    def _pl_extract_from_archive(self, src, name, target):
+        """把压缩包内的 name 解到 target（zip 流式，7z 解后改名）"""
+        s = Path(src)
+        target = Path(target)
+        if s.suffix.lower() == ".7z":
+            with py7zr.SevenZipFile(s, mode="r") as z:
+                z.extract(path=str(target.parent), targets=[name])
+            got = target.parent / name
+            if got.exists() and got.resolve() != target.resolve():
+                if target.exists():
+                    target.unlink()
+                shutil.move(str(got), str(target))
+        else:
+            with zipfile.ZipFile(s) as z, z.open(name) as fsrc, \
+                    open(target, "wb") as fdst:
+                while True:
+                    if self._pl_cancel.is_set():
+                        raise ExtractionCancelled()
+                    chunk = fsrc.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    fdst.write(chunk)
+        if not target.exists():
+            raise PayloadError("payload.bin 提取后未生成")
+
+    def _pl_finish(self):
+        self._pl_busy = False
+        self.plReadBtn.setEnabled(True)
+        self.plPickBtn.setEnabled(True)
+        self.plStopBtn.setEnabled(False)
+        try:
+            self.plProg.reset()               # 先复位
+            self.plProg.setFormat("空闲")      # 再显示为空闲态
+            self.plStageLb.setText("")
+        except Exception:
+            pass
+        self._pl_update_sel()
+
+    # ================================================================
+    # 提取流程
+    # ================================================================
+    def do_pl_extract(self):
+        names = self._pl_checked_names()
         if not names:
-            QMessageBox.information(self, "未选择", "请勾选要提取的分区。")
+            QMessageBox.information(self, "未选择", "请先勾选要提取的项目。")
             return
-
-        outdir = self.payloadOutE.text().strip()
+        if self._pl_busy:
+            QMessageBox.information(self, "正在处理", "上一个任务还没结束。")
+            return
+        outdir = self.plOutE.text().strip()
         if not outdir:
             QMessageBox.warning(self, "缺少输出目录", "请选择输出目录。")
             return
-        Path(outdir).mkdir(parents=True, exist_ok=True)
-
-        if self._payload_archive_mode:
-            self._start_archive_extract(names, outdir)
-            return
-
-        tool, kind = _find_tool()
-        if not tool:
-            QMessageBox.critical(self, "缺少工具",
-                "未找到 payload-dumper-go.exe。")
-            return
-        if not _find_xz():
-            QMessageBox.critical(
-                self, "缺少解压依赖",
-                "提取 payload 分区需要 xz.exe。\n\n"
-                "请安装 xz 并加入 PATH，或把 xz.exe 放到 tools 子目录。")
-            self.sig.log.emit("❌ 未找到 xz.exe，无法提取压缩分区", "error")
-            return
-
-        token, cancel = self._payload_start_busy()
-        self.lg(f"开始提取 {len(names)} 个分区 → {outdir}", "info")
-        self._payload_set_status(
-            f"⏳ 正在提取 {len(names)} 个分区 …", self.theme["warn"])
-
-        threading.Thread(
-            target=self._extract_worker_safe,
-            args=(token, cancel, tool, self._payload_src_value, names, outdir),
-            daemon=True).start()
-
-    def _start_archive_extract(self, names, outdir):
-        token, cancel = self._payload_start_busy()
-        self.lg(f"开始提取 {len(names)} 个压缩包文件 → {outdir}", "info")
-        self._payload_set_status(
-            f"⏳ 正在提取 {len(names)} 个文件 …", self.theme["warn"])
-        threading.Thread(
-            target=self._archive_extract_worker_safe,
-            args=(token, cancel, self._payload_src_value, names, outdir),
-            daemon=True).start()
-
-    def _archive_extract_worker_safe(self, token, cancel, src, names, outdir):
         try:
-            source = Path(src)
-            if source.suffix.lower() == ".7z":
-                if py7zr is None:
-                    raise RuntimeError("读取 7z 需要安装 py7zr")
-                with py7zr.SevenZipFile(source, mode="r") as package:
-                    package.extract(path=outdir, targets=names)
+            Path(outdir).mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            QMessageBox.warning(self, "输出目录不可用", f"{outdir}\n\n{e}")
+            return
+
+        self._pl_busy = True
+        self._pl_cancel = threading.Event()
+        self.plExtractBtn.setEnabled(False)
+        self.plStopBtn.setEnabled(True)
+        self.plReadBtn.setEnabled(False)
+        self._pl_set_prog(0)
+        self._pl_log("═" * 60, "plain")
+        self._pl_log(f"📤 开始提取 {len(names)} 项 → {outdir}", "info")
+        self._pl_set_status(f"⏳ 正在提取 {len(names)} 项 …", self.theme["warn"])
+        threading.Thread(target=self._pl_extract_worker,
+                         args=(names, outdir), daemon=True).start()
+
+    def _pl_extract_worker(self, names, outdir):
+        try:
+            if self._pl_archive_mode:
+                self._pl_extract_archive_entries(names, outdir)
             else:
-                root = Path(outdir).resolve()
-                with zipfile.ZipFile(source) as package:
-                    for name in names:
-                        if cancel.is_set():
-                            self._ui_if_current(token,
-                                lambda: self._extract_finish(token, False, "已停止"))
-                            return
-                        target = (root / name).resolve()
-                        if root != target and root not in target.parents:
-                            raise ValueError(f"非法压缩包路径：{name}")
-                        package.extract(name, root)
-            self._ui_if_current(token,
-                lambda: self._extract_finish(token, True, "✅ 压缩包文件提取完成"))
-        except Exception as exc:
-            self.sig.log.emit(f"❌ 压缩包提取异常：{exc}", "error")
-            self._ui_if_current(token,
-                lambda: self._extract_finish(token, False, "压缩包提取失败"))
+                src_obj = getattr(self, "_pl_src_reader", None) \
+                    or self._pl_payload_path
+                if isinstance(src_obj, str) and (
+                        not src_obj or not Path(src_obj).is_file()):
+                    self._pl_log("❌ payload 路径失效，请重新读取", "error")
+                    return
+                extractor = PayloadExtractor(
+                    src_obj, outdir,
+                    cancel_event=self._pl_cancel,
+                    log_cb=lambda m, lv="plain": self._pl_log(m, lv),
+                    prog_cb=lambda v: self.sig.ui.emit(
+                        lambda v=v: self._pl_progress_ui(v)),
+                    stage_cb=lambda nm: self.sig.ui.emit(
+                        lambda nm=nm: self._pl_stage(nm)),
+                )
+                ok_list, fail_list = extractor.extract(names)
+                if fail_list and not ok_list:
+                    names_txt = "、".join(n for n, _ in fail_list[:6])
+                    self._pl_log(f"❌ 全部失败（{len(fail_list)} 个）：{names_txt}",
+                                 "error")
+                    reason = fail_list[0][1] if fail_list else ""
+                    self.sig.ui.emit(lambda r=reason: self._pl_set_status(
+                        f"❌ 提取失败：{r[:70]}", self.theme["err"]))
+                elif fail_list:
+                    self._pl_log(
+                        f"⚠ 完成 {len(ok_list)} 个，失败 {len(fail_list)} 个："
+                        + "、".join(n for n, _ in fail_list[:6]), "warn")
+                    self._pl_log(f"✅ 已提取的文件在 → {outdir}", "ok")
+                    self.sig.ui.emit(lambda: self._pl_set_status(
+                        f"⚠ 部分完成：{len(ok_list)} 成功 / {len(fail_list)} 失败",
+                        self.theme["warn"]))
+                else:
+                    self._pl_log(f"✅ 提取完成 → {outdir}", "ok")
+                    self.sig.ui.emit(lambda: self._pl_set_status(
+                        "✅ 提取完成", self.theme["ok"]))
+        except ExtractionCancelled:
+            self._pl_log("⏹ 已停止", "warn")
+            self.sig.ui.emit(lambda: self._pl_set_status(
+                "⏹ 已停止", self.theme["warn"]))
+        except PayloadError as e:
+            self._pl_log(f"❌ 提取失败：{e}", "error")
+            self.sig.ui.emit(lambda m=str(e): self._pl_set_status(
+                f"❌ {m}", self.theme["err"]))
+        except Exception as e:
+            self._pl_log(f"❌ 异常：{e}", "error")
+        finally:
+            self.sig.ui.emit(self._pl_finish)
 
-    def _extract_worker_safe(self, token, cancel, tool, src, names, outdir):
-        try:
-            self._extract_worker(token, cancel, tool, src, names, outdir)
-        except Exception as exc:
-            self.sig.log.emit(f"❌ 提取异常：{exc}", "error")
-            self._ui_if_current(token,
-                lambda: self._extract_finish(token, False, "提取异常"))
+    def _pl_extract_archive_entries(self, names, outdir):
+        """普通压缩包模式：解出勾选条目（含 zip-slip 校验）"""
+        src = Path(self._pl_src)
+        root = Path(outdir).resolve()
+        total = max(1, len(names))
+        for i, name in enumerate(names, 1):
+            if self._pl_cancel.is_set():
+                raise ExtractionCancelled()
+            pct = int(i * 100 / total)
+            self.sig.ui.emit(lambda v=pct: self._pl_set_prog(v))
+            if src.suffix.lower() == ".7z":
+                if py7zr is None:
+                    raise PayloadError("读取 7z 需要安装 py7zr：pip install py7zr")
+                with py7zr.SevenZipFile(src, mode="r") as z:
+                    z.extract(path=str(root), targets=[name])
+            else:
+                target = (root / name).resolve()
+                if root != target and root not in target.parents:
+                    raise PayloadError(f"非法压缩包路径：{name}")
+                with zipfile.ZipFile(src) as z:
+                    z.extract(name, root)
+            self._pl_log(f"  ✓ {name}", "plain")
+        self._pl_log(f"✅ 已解出 {total} 个条目 → {outdir}", "ok")
+        self.sig.ui.emit(lambda: self._pl_set_status("✅ 提取完成", self.theme["ok"]))
 
-    def _extract_worker(self, token, cancel, tool, src, names, outdir):
-        cmd = [tool,
-               "-p", ",".join(names),
-               "-o", outdir,
-               src]
-        self.sig.log.emit(f"执行：{' '.join(cmd)}", "info")
-
-        def on_text(line):
-            s = (line or "").rstrip()
-            if not s:
-                return
-            self.sig.log.emit(f"[tool] {s}", "plain")
-            m = PROG_RE.search(s)
-            if m:
-                try:
-                    v = int(m.group(1))
-                    self._ui_if_current(
-                        token, lambda v=v: self._payload_set_prog(v))
-                except Exception:
-                    pass
-
-        rc, output = _run_cli(cmd, cancel_event=cancel, on_text=on_text)
-
-        if rc == -100:
-            self.sig.log.emit("⏹ 提取已停止", "warn")
-            self._ui_if_current(token,
-                lambda: self._extract_finish(token, False, "已停止"))
+    def do_pl_stop(self):
+        if not self._pl_busy:
             return
-
-        if rc == 0:
-            self._ui_if_current(token,
-                lambda: self._extract_finish(token, True, "✅ 提取完成"))
-        else:
-            if output.strip():
-                self.sig.log.emit(f"工具输出：{output[:3000]}", "error")
-            self._ui_if_current(token,
-                lambda: self._extract_finish(token, False, f"工具返回码 {rc}"))
-
-    def _extract_finish(self, token, ok, msg):
-        self._payload_end_busy(token)
-        if ok:
-            self._payload_set_status(msg, self.theme["ok"])
-            self.lg(msg, "ok")
-        else:
-            self._payload_set_status(f"❌ {msg}", self.theme["err"])
-            self.lg(f"❌ {msg}", "error")
+        self._pl_cancel.set()
+        self.plStopBtn.setEnabled(False)
+        self._pl_log("⏹ 正在停止 …", "warn")
+        self._pl_set_status("⏹ 正在停止 …", self.theme["warn"])

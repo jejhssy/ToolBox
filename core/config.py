@@ -39,6 +39,24 @@ THEMES = [
      "text":"#e0f0ff","dim":"#7a94a8","acc":"#38bdf8","acc2":"#7dd3fc",
      "ok":"#4ade80","warn":"#fbbf24","err":"#f87171","log":"#081018",
      "menu":"#0c1a26","menuSel":"#38bdf8","menuTxt":"#c8e0f0"},
+         # ---------- 浅色主题 ----------
+    # 6. 浅白蓝（清爽）
+    {"bg":"#f5f7fb","panel":"#ffffff","panel2":"#eef2f9","line":"#d4dbe8",
+     "text":"#1a2233","dim":"#68758c","acc":"#2563eb","acc2":"#3b82f6",
+     "ok":"#16a34a","warn":"#d97706","err":"#dc2626","log":"#e8edf5",
+     "menu":"#eef2f9","menuSel":"#2563eb","menuTxt":"#3a4458"},
+
+    # 7. 浅暖米黄
+    {"bg":"#faf7f2","panel":"#ffffff","panel2":"#f5efe6","line":"#e0d6c4",
+     "text":"#2d2418","dim":"#807262","acc":"#c2410c","acc2":"#ea580c",
+     "ok":"#16a34a","warn":"#ca8a04","err":"#dc2626","log":"#f2ebdf",
+     "menu":"#f0e8da","menuSel":"#c2410c","menuTxt":"#4a3d2a"},
+
+    # 8. 浅紫
+    {"bg":"#f7f5fc","panel":"#ffffff","panel2":"#f0ecfa","line":"#ddd6f0",
+     "text":"#241b3d","dim":"#6b6285","acc":"#7c3aed","acc2":"#8b5cf6",
+     "ok":"#16a34a","warn":"#d97706","err":"#dc2626","log":"#eee9f7",
+     "menu":"#f0ebfa","menuSel":"#7c3aed","menuTxt":"#4a3d68"},
 ]
 
 FASTBOOTD_PARTS = {"init_boot", "vendor_boot", "super",
@@ -50,15 +68,15 @@ SPECIAL_OPTS = {
 }
 
 FILE_KINDS = {
-    "folder": ("▣", "#38bdf8"),
-    "image":  ("◆", "#c084fc"),
-    "video":  ("▶", "#f472b6"),
-    "audio":  ("♪", "#4ade80"),
-    "apk":    ("⬡", "#fb923c"),
-    "text":   ("≡", "#fbbf24"),
-    "zip":    ("❖", "#a78bfa"),
-    "img":    ("▦", "#60a5fa"),
-    "file":   ("◇", "#94a3b8"),
+    "folder": ("📁", "#38bdf8"),
+    "image":  ("🖼️", "#c084fc"),
+    "video":  ("🎬", "#f472b6"),
+    "audio":  ("🎵", "#4ade80"),
+    "apk":    ("📦", "#fb923c"),
+    "text":   ("📄", "#fbbf24"),
+    "zip":    ("🗜️", "#a78bfa"),
+    "img":    ("💿", "#60a5fa"),
+    "file":   ("📎", "#94a3b8"),
 }
 
 CARD_W, CARD_H = 110, 120

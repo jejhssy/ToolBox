@@ -5,49 +5,75 @@ from PyQt6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QGridLayout, QScrollArea, QFrame, QMessageBox, QProgressBar,
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QRect
 from PyQt6.QtGui import QPainter, QColor, QPen
-from core.widgets import Card
-from core.utils import adb_dev, fb_dev, sh, read_device_info, read_device_stats
+from core.widgets import Card, set_state, state_from_color
+from core.utils import (
+    adb_dev, fb_dev, sh, read_device_info, read_device_stats, adb_shell_dev,
+)
 
 
 class CircleProgress(QWidget):
-    """圆形进度圈"""
+    """圆形进度圈：圆内显示百分比 + 容量，名称放圆外"""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(90, 90)
+        self.setFixedSize(120, 120)
         self._pct = 0.0
         self._color = "#4f8cff"
-        self._text_color = "#e8ecf7"
+        self._base = "#2a3555"      # 底环颜色
+        self._txt = "#e8ecf7"       # 百分比颜色
+        self._dim = "#8892b0"       # 小字颜色
+        self._sub = ""              # 容量文字（圆内下方小字）
 
-    def set_value(self, pct, color, text_color):
+    def set_value(self, pct, color, base_color, text_color, sub="",
+                  dim_color=None):
         self._pct = max(0.0, min(100.0, float(pct)))
         self._color = color
-        self._text_color = text_color
+        self._base = base_color
+        self._txt = text_color
+        if dim_color:
+            self._dim = dim_color
+        self._sub = sub or ""
         self.update()
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = self.rect().adjusted(8, 8, -8, -8)
+        rect = self.rect().adjusted(10, 10, -10, -10)
 
-        pen = QPen(QColor("#2a3555"))
-        pen.setWidth(7)
+        # 底环
+        pen = QPen(QColor(self._base))
+        pen.setWidth(9)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         p.setPen(pen)
         p.drawArc(rect, 0, 360 * 16)
 
+        # 进度环
         pen.setColor(QColor(self._color))
         p.setPen(pen)
         span = int(-self._pct / 100 * 360 * 16)
         p.drawArc(rect, 90 * 16, span)
 
-        p.setPen(QColor(self._text_color))
+        # 圆内：百分比
         f = p.font()
-        f.setPointSize(11)
+        f.setPointSize(13)
         f.setBold(True)
         p.setFont(f)
-        p.drawText(rect, Qt.AlignmentFlag.AlignCenter, f"{self._pct:.1f}%")
+        p.setPen(QColor(self._txt))
+        if self._sub:
+            p.drawText(
+                QRect(rect.left(), rect.top() + 26, rect.width(), 26),
+                Qt.AlignmentFlag.AlignCenter, f"{self._pct:.1f}%")
+            # 圆内：容量小字
+            f.setPointSize(6)
+            f.setBold(False)
+            p.setFont(f)
+            p.setPen(QColor(self._dim))
+            p.drawText(
+                QRect(rect.left(), rect.top() + 54, rect.width(), 16),
+                Qt.AlignmentFlag.AlignCenter, self._sub)
+        else:
+            p.drawText(rect, Qt.AlignmentFlag.AlignCenter, f"{self._pct:.1f}%")
         p.end()
 
 
@@ -146,16 +172,12 @@ class InfoPageMixin:
         bv.addWidget(batTitle)
 
         self.batteryBar = QProgressBar()
+        self.batteryBar.setObjectName("batteryBar")
         self.batteryBar.setRange(0, 100)
         self.batteryBar.setValue(0)
         self.batteryBar.setFixedHeight(46)
         self.batteryBar.setTextVisible(True)
         self.batteryBar.setFormat("%p%")
-        self.batteryBar.setStyleSheet(
-            "QProgressBar{background:#0a0f1e; border:1px solid #2a3555;"
-            "border-radius:8px; color:#e8ecf7;"
-            "font-size:14pt; font-weight:bold; text-align:center;}"
-            "QProgressBar::chunk{background:#4ade80; border-radius:7px;}")
         bv.addWidget(self.batteryBar)
 
         self.batteryStatus = QLabel("—")
@@ -184,7 +206,7 @@ class InfoPageMixin:
         self.storageCircle = CircleProgress()
         storageBox.addWidget(self.storageCircle,
                              alignment=Qt.AlignmentFlag.AlignCenter)
-        self.storageLabel = QLabel("内部存储\n—")
+        self.storageLabel = QLabel("内部存储")
         self.storageLabel.setObjectName("desc")
         self.storageLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
         storageBox.addWidget(self.storageLabel)
@@ -195,7 +217,7 @@ class InfoPageMixin:
         self.memCircle = CircleProgress()
         memBox.addWidget(self.memCircle,
                          alignment=Qt.AlignmentFlag.AlignCenter)
-        self.memLabel = QLabel("运行内存\n—")
+        self.memLabel = QLabel("运行内存")
         self.memLabel.setObjectName("desc")
         self.memLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
         memBox.addWidget(self.memLabel)
@@ -230,17 +252,21 @@ class InfoPageMixin:
         self.rbRec = QPushButton("🔧  Recovery")
         self.rbBL = QPushButton("⚡  Bootloader")
         self.rbFB = QPushButton("📲  Fastbootd")
+        self.rbSL = QPushButton("🛰  Sideload")
         self.rbDl = QPushButton("⚙  深度下载")
         for b, tip in (
             (self.rbSys, "重启到系统（正常开机）"),
             (self.rbRec, "重启到 Recovery 恢复模式"),
             (self.rbBL, "重启到 Bootloader（传统 fastboot）"),
             (self.rbFB, "重启到 Fastbootd（用户空间 fastboot）"),
+            (self.rbSL, "重启到 Sideload 侧载模式：给「🛠 Recovery 工具」的侧载刷机用\n"
+                        "（手机在系统 / Recovery 模式下都能发这个命令）"),
             (self.rbDl, "进入深度下载模式（需解锁 BL）"),
         ):
             b.setObjectName("secondary")
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.setFixedHeight(48)
+            b.setMinimumWidth(96)
             b.setToolTip(tip)
             rv2.addWidget(b)
         rv2.addStretch()
@@ -250,18 +276,13 @@ class InfoPageMixin:
         self.rbRec.clicked.connect(lambda: self.do_reboot("recovery"))
         self.rbBL.clicked.connect(lambda: self.do_reboot("bootloader"))
         self.rbFB.clicked.connect(lambda: self.do_reboot("fastboot"))
+        self.rbSL.clicked.connect(lambda: self.do_reboot("sideload"))
         self.rbDl.clicked.connect(lambda: self.do_reboot("download"))
 
         v.addStretch()
 
-        scroll = QScrollArea()
-        scroll.setObjectName("pageScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setWidget(inner)
         QTimer.singleShot(300, self.do_read_stats)
-        return scroll
+        return inner
 
     # ==================== 颜色 / 信息刷新 ====================
     def _value_color(self, key, value):
@@ -270,15 +291,15 @@ class InfoPageMixin:
         if key == "state":
             return c["ok"] if v.startswith("已连接") else c["err"]
         if key == "mode":
-            return "#60a5fa"
+            return c["acc2"]
         if key in ("serial", "device", "platform"):
-            return "#c084fc"
+            return c["acc"]
         if key in ("model", "soc_model", "android"):
-            return "#fb923c"
+            return c["warn"]
         if key in ("incremental", "build_date", "host_os"):
-            return "#f87171"
+            return c["err"]
         if key == "kernel":
-            return "#22d3ee"
+            return c["ok"]
         if key == "unlock":
             if "解锁" in v and "锁定" not in v:
                 return c["ok"]
@@ -332,7 +353,7 @@ class InfoPageMixin:
 
     def _set_dev(self, txt, col):
         self.devLabel.setText(txt)
-        self.devLabel.setStyleSheet(f"color: {col}; font-weight: bold; background: transparent;")
+        set_state(self.devLabel, state_from_color(self.theme, col))
         
     # ==================== 电量 / 存储 / 内存 ====================
     def _apply_stats(self, stats):
@@ -367,26 +388,28 @@ class InfoPageMixin:
             # 存储
             sp = stats.get("storage_used_pct")
             if sp is None:
-                self.storageCircle.set_value(0, c["acc"], c["text"])
-                self.storageLabel.setText("内部存储\n—")
+                self.storageCircle.set_value(0, c["acc"], c["line"], c["text"])
+                self.storageLabel.setText("内部存储")
             else:
                 col = c["err"] if sp >= 90 else (c["warn"] if sp >= 75 else c["acc"])
-                self.storageCircle.set_value(sp, col, c["text"])
-                self.storageLabel.setText(
-                    f"内部存储\n{stats.get('storage_used','—')} / "
-                    f"{stats.get('storage_total','—')}")
+                sub = (f"{stats.get('storage_used','—')} / "
+                       f"{stats.get('storage_total','—')}")
+                self.storageCircle.set_value(sp, col, c["line"], c["text"], sub,
+                                        c["dim"])
+                self.storageLabel.setText("内部存储")
 
             # 内存
             mp = stats.get("mem_used_pct")
             if mp is None:
-                self.memCircle.set_value(0, c["acc"], c["text"])
-                self.memLabel.setText("运行内存\n—")
+                self.memCircle.set_value(0, c["acc"], c["line"], c["text"])
+                self.memLabel.setText("运行内存")
             else:
                 col = c["err"] if mp >= 90 else (c["warn"] if mp >= 75 else c["acc2"])
-                self.memCircle.set_value(mp, col, c["text"])
-                self.memLabel.setText(
-                    f"运行内存\n{stats.get('mem_used','—')} / "
-                    f"{stats.get('mem_total','—')}")
+                sub = (f"{stats.get('mem_used','—')} / "
+                       f"{stats.get('mem_total','—')}")
+                self.memCircle.set_value(mp, col, c["line"], c["text"], sub,
+                                     c["dim"])
+                self.memLabel.setText("运行内存")
         except Exception:
             pass
 
@@ -424,6 +447,7 @@ class InfoPageMixin:
             "recovery":   ("Recovery",     "重启到 Recovery 恢复模式"),
             "bootloader": ("Bootloader",   "重启到 Bootloader（传统 fastboot）"),
             "fastboot":   ("Fastbootd",    "重启到 Fastbootd（用户空间 fastboot）"),
+            "sideload":   ("Sideload",     "重启到 Sideload 侧载模式（侧载刷机用）"),
             "download":   ("深度下载模式", "进入深度下载模式"),
         }
         name, desc = tips.get(target, (target, target))
@@ -441,6 +465,13 @@ class InfoPageMixin:
         def w():
             try:
                 ds, _ = adb_dev()
+                if not ds:
+                    # Recovery（TWRP 等）下 adb_dev() 不算数，但 adb reboot / adb shell 照样能用
+                    serial = adb_shell_dev()
+                    if serial:
+                        ds = [serial]
+                        self.sig.log.emit(
+                            "检测到设备在 Recovery 模式（adb 命令同样可用）", "info")
                 fs, _ = fb_dev()
                 self.sig.log.emit(
                     f"当前连接：ADB={ds or '无'} / Fastboot={fs or '无'}", "plain")
@@ -458,6 +489,33 @@ class InfoPageMixin:
                     self.sig.log.emit(
                         "✓ 已发送下载模式重启" if rc == 0 else f"❌ 失败（{rc}）",
                         "ok" if rc == 0 else "error")
+                    return
+
+                # ---------- 重启到 Sideload（侧载刷机用）----------
+                if target == "sideload":
+                    if ds:
+                        cmd = ["adb", "-s", ds[0], "reboot", "sideload"]
+                        self.sig.log.emit(f"执行：{' '.join(cmd)}", "info")
+                        rc, out = sh(cmd, timeout=15)
+                        if out:
+                            self.sig.log.emit(out, "plain")
+                        self.sig.log.emit(
+                            "✓ 已发送 Sideload 重启（手机通常会显示 "
+                            "“Now send the package…”）" if rc == 0 else f"❌ 失败（{rc}）",
+                            "ok" if rc == 0 else "error")
+                        return
+                    if fs:
+                        cmd = ["fastboot", "-s", fs[0], "reboot", "sideload"]
+                        self.sig.log.emit(f"执行：{' '.join(cmd)}", "info")
+                        rc, out = sh(cmd, timeout=20)
+                        if out:
+                            self.sig.log.emit(out, "plain")
+                        self.sig.log.emit(
+                            "✓ 已发送 Sideload 重启" if rc == 0 else f"❌ 失败（{rc}）",
+                            "ok" if rc == 0 else "error")
+                        return
+                    self.sig.log.emit(
+                        "❌ 未检测到设备（系统 / Recovery 模式都可以）", "error")
                     return
 
                 # ---------- 重启到系统 ----------

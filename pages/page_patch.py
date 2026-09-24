@@ -1,22 +1,54 @@
 # -*- coding: utf-8 -*-
-"""页面 2：Preloader 修补"""
-import threading, traceback
+"""页面 2：Preloader 修补（boot1/boot2 提权镜像）
+
+本页只保留 Preloader 修补。
+Magisk 脱机修补（修补 boot/init_boot、一键 Root、AVB 签名）已按 VioletToolBox
+的设计重做为独立的「脱机修补」页：pages/page_offline.py
+核心逻辑：core/magisk_patch.py（修补流程） / core/avb.py（AVB 分析重建签名）
+"""
+import os, sys, subprocess, threading, time, traceback
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QLineEdit, QProgressBar, QMessageBox, QFileDialog,
+    QTextEdit, QFrame, QScrollArea,
 )
 from PyQt6.QtCore import Qt
 from core.config import SIZE_OK, MAGIC, OUT_DIR, ZIP_MAGICS, AUTHOR
+from core.widgets import AnimatedProgressBar, set_state
 
 
 class PatchPageMixin:
 
     def _page_patch(self):
-        w = QWidget()
-        v = QVBoxLayout(w)
+        inner = QWidget()
+        v = QVBoxLayout(inner)
         v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(12)
+        v.setSpacing(14)
+
+        self._build_preloader_section(v)
+        self._build_log_section(v)
+
+        v.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setObjectName("pageScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(inner)
+        return scroll
+
+    # ================================================================
+    # 区域一：Magisk 修补 + 一键 Root
+    # ================================================================
+    def _build_preloader_section(self, v):
+        sep = QFrame()
+        sep.setObjectName("hline")
+        sep.setFixedHeight(1)
+        v.addSpacing(6)
+        v.addWidget(sep)
+        v.addSpacing(6)
 
         t = QLabel("🔧  Preloader 修补")
         t.setObjectName("cardTitle")
@@ -25,7 +57,6 @@ class PatchPageMixin:
         d.setObjectName("desc")
         v.addWidget(d)
 
-        v.addWidget(self._label("文件路径"))
         row = QHBoxLayout()
         row.setSpacing(10)
         self.pE = QLineEdit()
@@ -54,7 +85,7 @@ class PatchPageMixin:
         self.sTxt = QLabel("未选择文件")
         self.sTxt.setObjectName("status")
         row2.addWidget(self.sTxt)
-        self.pbar = QProgressBar()
+        self.pbar = AnimatedProgressBar()
         self.pbar.setRange(0, 100)
         self.pbar.setValue(0)
         self.pbar.setFixedHeight(10)
@@ -81,9 +112,63 @@ class PatchPageMixin:
         row3.addWidget(self.oBtn)
         row3.addStretch()
         v.addLayout(row3)
-        v.addStretch()
-        return w
 
+    # ================================================================
+    # 区域三：统一日志
+    # ================================================================
+    def _build_log_section(self, v):
+        sep = QFrame()
+        sep.setObjectName("hline")
+        sep.setFixedHeight(1)
+        v.addSpacing(6)
+        v.addWidget(sep)
+        v.addSpacing(6)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        t = QLabel("📜  运行日志")
+        t.setObjectName("cardTitle")
+        head.addWidget(t)
+        head.addStretch()
+        self.logClearBtn = QPushButton("清空")
+        self.logClearBtn.setObjectName("smallGhost")
+        self.logClearBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.logClearBtn.setFixedHeight(30)
+        self.logClearBtn.clicked.connect(self._clear_patch_log)
+        head.addWidget(self.logClearBtn)
+        v.addLayout(head)
+
+        self.patchLog = QTextEdit()
+        self.patchLog.setReadOnly(True)
+        self.patchLog.setObjectName("log")
+        self.patchLog.setPlaceholderText("修补、一键 Root、Preloader 修补的日志都会显示在这里…")
+        self.patchLog.setMinimumHeight(200)
+        v.addWidget(self.patchLog)
+
+    # ================================================================
+    # 统一日志
+    # ================================================================
+    def _patch_log(self, msg, level="plain"):
+        if not hasattr(self, "patchLog"):
+            return
+        colors = {"info": self.theme["acc"], "ok": self.theme["ok"],
+                  "warn": self.theme["warn"], "error": self.theme["err"],
+                  "plain": self.theme["text"]}
+        col = colors.get(level, self.theme["text"])
+        self.patchLog.append(f'<span style="color:{col}">{msg}</span>')
+        sb = self.patchLog.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _patch_log_async(self, msg, level="plain"):
+        self.sig.ui.emit(lambda m=msg, l=level: self._patch_log(m, l))
+
+    def _clear_patch_log(self):
+        if hasattr(self, "patchLog"):
+            self.patchLog.clear()
+
+    # ================================================================
+    # 面具选择
+    # ================================================================
     def _dotc(self, t):
         c = self.theme
         return {"未选择文件": c["dim"], "已就绪": c["ok"],
@@ -134,28 +219,29 @@ class PatchPageMixin:
             return
 
         if any(head.startswith(m) for m in ZIP_MAGICS) or \
-           name_low.endswith((".rar", ".zip", ".7z", ".tar", ".gz", ".bz2", ".xz", ".zst")):
+           name_low.endswith((".rar", ".zip", ".7z", ".tar", ".gz",
+                              ".bz2", ".xz", ".zst")):
             QMessageBox.warning(
                 self, "文件类型错误",
                 "❌ 你选择的是压缩包，不是 preloader 镜像！\n\n"
                 "请先解压，然后选择解压出来的 boot1.bin / boot2.bin 等 .bin 文件。")
             self._set_stat("未选择文件")
-            self.lg("❌ 拒绝了压缩包文件（请解压后选择 .bin）", "error")
+            self._patch_log("❌ 拒绝了压缩包文件（请解压后选择 .bin）", "error")
             return
 
         if not name_low.endswith(".bin"):
-            self.lg(f"⚠ 注意：文件后缀不是 .bin（{p.name}）", "warn")
+            self._patch_log(f"⚠ 注意：文件后缀不是 .bin（{p.name}）", "warn")
 
         self.src = p
         self.pE.setText(str(p))
         s = p.stat().st_size
         if s == SIZE_OK:
             self.pInfo.setText(f"✓ 文件大小：{s:,} 字节（{hex(s)}），与 0x400000 一致")
-            self.pInfo.setStyleSheet(f"color: {self.theme['ok']}; background: transparent;")
+            set_state(self.pInfo, "ok")
         else:
             self.pInfo.setText(f"⚠ 文件大小：{s:,} 字节（{hex(s)}），期望 0x{SIZE_OK:X}")
-            self.pInfo.setStyleSheet(f"color: {self.theme['warn']}; background: transparent;")
-        self.lg(f"已选择：{self.src}", "info")
+            set_state(self.pInfo, "warn")
+        self._patch_log(f"已选择：{self.src}", "info")
         self.stBtn.setEnabled(True)
         self._set_stat("已就绪")
 
@@ -163,11 +249,11 @@ class PatchPageMixin:
         d = QFileDialog.getExistingDirectory(self, "选择输出目录")
         if d:
             self.outdir = Path(d)
-            self.lg(f"输出目录：{self.outdir}", "info")
+            self._patch_log(f"输出目录：{self.outdir}", "info")
 
     def run_patch(self):
         if self.working:
-            self.lg("修补任务正在运行，请稍候…", "warn")
+            self._patch_log("修补任务正在运行，请稍候…", "warn")
             return
         if not self.src:
             QMessageBox.warning(self, "未选择文件", "请先选择 preloader 文件。")
@@ -178,20 +264,20 @@ class PatchPageMixin:
         self.stBtn.setText("⏳  修补中…")
         self._set_stat("处理中…")
         self.pbar.setValue(0)
-        self.lg("─" * 60)
-        self.lg(f"开始修补：{self.src.name}", "info")
+        self._patch_log("─" * 60, "plain")
+        self._patch_log(f"开始修补：{self.src.name}", "info")
         threading.Thread(target=self._work, daemon=True).start()
 
     def _work(self):
         try:
             self._do_patch()
         except Exception as e:
-            self.sig.log.emit(f"[错误] {e}", "error")
-            self.sig.log.emit(traceback.format_exc(), "error")
+            self._patch_log_async(f"[错误] {e}", "error")
+            self._patch_log_async(traceback.format_exc(), "error")
             try:
                 if self.outpath and Path(self.outpath).exists():
                     Path(self.outpath).unlink()
-                    self.sig.log.emit(f"已删除未完成的输出：{self.outpath}", "warn")
+                    self._patch_log_async(f"已删除未完成的输出：{self.outpath}", "warn")
             except Exception:
                 pass
             self.outpath = None
@@ -211,43 +297,43 @@ class PatchPageMixin:
         self.outdir.mkdir(parents=True, exist_ok=True)
         out = self.outdir / src.name
 
-        self.sig.log.emit(f"读取文件：{size:,} 字节（{hex(size)}）", "plain")
+        self._patch_log_async(f"读取文件：{size:,} 字节（{hex(size)}）", "plain")
         if head16.startswith(b"UFS_BOOT"):
-            self.sig.log.emit("内存类型：UFS_BOOT", "plain")
+            self._patch_log_async("内存类型：UFS_BOOT", "plain")
         elif head16.startswith(b"EMMC_BOOT"):
-            self.sig.log.emit("内存类型：EMMC_BOOT", "plain")
+            self._patch_log_async("内存类型：EMMC_BOOT", "plain")
         elif head16.startswith(b"COMBO_BOOT"):
-            self.sig.log.emit("内存类型：COMBO_BOOT（UFS）", "plain")
+            self._patch_log_async("内存类型：COMBO_BOOT（UFS）", "plain")
         elif head16.startswith(b"MMM\x018\x00\x00\x00FILE_INF"):
             raise Exception("RAW 格式 preloader 不支持")
         else:
-            self.sig.log.emit(f"内存类型：{head16!r}（未知）", "warn")
+            self._patch_log_async(f"内存类型：{head16!r}（未知）", "warn")
         self.sig.prog.emit(20)
 
         pos = data.find(MAGIC)
         if pos == -1:
             raise Exception("未找到 flag block 魔数（不是有效的 preloader 镜像）")
-        self.sig.log.emit("✓ 找到 flag block", "ok")
+        self._patch_log_async("✓ 找到 flag block", "ok")
         flag = bytes(data[pos:pos + 0x78])
         lk = data[pos + 0x4C]
         if lk == 0x22:
-            self.sig.log.emit("锁定状态：22（已锁定）", "plain")
+            self._patch_log_async("锁定状态：22（已锁定）", "plain")
         elif lk == 0x11:
-            self.sig.log.emit("锁定状态：11（硬锁定）", "plain")
+            self._patch_log_async("锁定状态：11（硬锁定）", "plain")
         else:
-            self.sig.log.emit(f"锁定状态：{hex(lk)}（已解锁）", "ok")
+            self._patch_log_async(f"锁定状态：{hex(lk)}（已解锁）", "ok")
         self.sig.prog.emit(40)
 
         co = data[0x20D] * 256
         c1, c2, c3, c4, c5 = (data[0x21D], data[0x211], data[0x212],
                               data[0x221], data[0x222])
-        self.sig.log.emit(f"代码偏移 = 0x{co:X}", "plain")
+        self._patch_log_async(f"代码偏移 = 0x{co:X}", "plain")
         if co >= size:
             raise Exception(f"代码偏移 0x{co:X} 超过文件大小，文件可能损坏")
         raw = bytes(data[co:size - 0x3000]) if size > 0x3000 else b""
         data[co:] = b"\x00" * (size - co)
         if 0x2000 - co >= 0:
-            self.sig.log.emit(f"代码跳转：0x{co:X} → 0x2000", "plain")
+            self._patch_log_async(f"代码跳转：0x{co:X} → 0x2000", "plain")
             if 0x2000 + len(raw) > size:
                 raise Exception("代码段超出文件末尾，文件可能不完整")
             data[0x2000:0x2000 + len(raw)] = raw
@@ -255,27 +341,30 @@ class PatchPageMixin:
             raise Exception("代码缩进超过 0x2000")
         self.sig.prog.emit(60)
 
-        self.sig.log.emit("修改 BRLYT 偏移", "plain")
+        self._patch_log_async("修改 BRLYT 偏移", "plain")
         data[0x20D] = 0x20
         data[0x21D] = 0x20
         data[0x211] = 0x10
         data[0x212] = 0x10
         data[0x221] = 0x10
         data[0x222] = 0x10
-        self.sig.log.emit(f"0x20d：{co // 256:02x} → 20 | 0x21d：{c1:02x} → 20", "plain")
-        self.sig.log.emit(f"0x211：{c2:02x} → 10 | 0x212：{c3:02x} → 10", "plain")
-        self.sig.log.emit(f"0x221：{c4:02x} → 10 | 0x222：{c5:02x} → 10", "plain")
+        self._patch_log_async(
+            f"0x20d：{co // 256:02x} → 20 | 0x21d：{c1:02x} → 20", "plain")
+        self._patch_log_async(
+            f"0x211：{c2:02x} → 10 | 0x212：{c3:02x} → 10", "plain")
+        self._patch_log_async(
+            f"0x221：{c4:02x} → 10 | 0x222：{c5:02x} → 10", "plain")
         self.sig.prog.emit(80)
 
         data[0x1000:0x1000 + len(flag)] = flag
-        self.sig.log.emit(f"Fastboot 锁定标志：0x{lk:02x} → 00", "plain")
+        self._patch_log_async(f"Fastboot 锁定标志：0x{lk:02x} → 00", "plain")
         data[0x104C] = 0x00
         self.sig.prog.emit(95)
 
         self.outpath = None
         out.write_bytes(bytes(data))
         self.outpath = out
-        self.sig.log.emit(f"✅ 已生成：{out.resolve()}", "ok")
+        self._patch_log_async(f"✅ 已生成：{out.resolve()}", "ok")
         self.sig.prog.emit(100)
 
     def _ok(self):
@@ -283,7 +372,7 @@ class PatchPageMixin:
         self.stBtn.setEnabled(True)
         self.stBtn.setText("🚀  开始修补")
         self._set_stat("完成")
-        self.lg("修补完成。", "ok")
+        self._patch_log("修补完成。", "ok")
         QMessageBox.information(
             self, "成功",
             f"已生成：\n{self.outpath.resolve()}\n\n"
@@ -295,7 +384,7 @@ class PatchPageMixin:
         self.stBtn.setText("🚀  开始修补")
         self._set_stat("失败")
         self.pbar.setValue(0)
-        self.lg(f"❌ 修补失败，已终止：{err}", "error")
+        self._patch_log(f"❌ 修补失败，已终止：{err}", "error")
         QMessageBox.critical(
             self, "修补失败",
             f"❌ 修补失败，已立即停止！\n\n原因：{err}\n\n"
